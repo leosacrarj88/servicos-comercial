@@ -1019,5 +1019,10 @@ def _google_details_batch(place_ids, api_key, max_workers=10):
     st.caption("Mapa Comercial por categorias")
 
 
+
+# ===============================
+# Execução
+# ===============================
+
 if __name__ == "__main__":
-   main()
+    main()
