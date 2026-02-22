@@ -37,13 +37,7 @@ from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 import sys
 import os
-import subprocess
 from pathlib import Path
-
-try:
-    from pyngrok import ngrok
-except Exception:
-    ngrok = None
 
 # ===============================
 # APP
