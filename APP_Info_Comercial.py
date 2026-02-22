@@ -1030,7 +1030,7 @@ def _google_details_batch(place_ids, api_key, max_workers=10):
     
         # --- CONFIGURAÇÃO NGROK ---
         # Mude para True se quiser abrir o link para a internet automaticamente
-        MODO_ONLINE = True 
+        MODO_ONLINE = False 
         NGROK_AUTH_TOKEN = "35RkSd48qM6Ht5KFkZKyoSclZzr_2jn9As8o6P14JCy7hGrzh"
         # --------------------------
 
