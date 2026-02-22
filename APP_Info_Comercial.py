@@ -21,7 +21,6 @@ pip install streamlit pandas requests geopy folium streamlit-folium
 # IMPORTS
 # ===============================
 import time
-import concurrent.futures
 import math
 import json
 import re
@@ -37,7 +36,13 @@ from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 import sys
 import os
+import subprocess
 from pathlib import Path
+
+try:
+    from pyngrok import ngrok
+except Exception:
+    ngrok = None
 
 # ===============================
 # APP
@@ -425,25 +430,6 @@ def main():
             j = {"status": "BAD_JSON", "error_message": r.text[:200]}
         return j, r.status_code
 
-
-
-def _google_details_batch(place_ids, api_key, max_workers=10):
-    """Busca details em paralelo. Retorna dict: place_id -> (json, http_status)."""
-    place_ids = [pid for pid in (place_ids or []) if pid]
-    if not place_ids:
-        return {}
-    max_workers = max(2, min(int(max_workers), 16, len(place_ids)))
-    out = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(_google_details, pid, api_key): pid for pid in place_ids}
-        for fut in concurrent.futures.as_completed(futs):
-            pid = futs[fut]
-            try:
-                out[pid] = fut.result()
-            except Exception:
-                out[pid] = ({"status":"ERROR","error_message":"details failed"}, 0)
-    return out
-
     @st.cache_data(ttl=24*3600)
     def fetch_place_photo_bytes(photo_reference: str, api_key: str, maxwidth: int = 520):
         """
@@ -493,13 +479,8 @@ def _google_details_batch(place_ids, api_key, max_workers=10):
         if j.get("status") != "OK":
             return []
 
-        results = (j.get("results") or [])[:30]
-        place_ids = [r.get("place_id") for r in results if r.get("place_id")]
-        # details em paralelo (evita N x latência)
-        details_map = _google_details_batch(place_ids, api_key, max_workers=10)
-
-        out = []
-        for r in results:
+        out=[]
+        for r in (j.get("results") or [])[:30]:
             pid = r.get("place_id")
             geom = (r.get("geometry") or {}).get("location") or {}
             plat = geom.get("lat")
@@ -509,22 +490,22 @@ def _google_details_batch(place_ids, api_key, max_workers=10):
 
             photo_ref, photo_attr = _photo_pick_from_result(r)
 
-            details = {}
-            if pid and pid in details_map:
-                dj, dh = details_map.get(pid, ({}, 0))
+            details={}
+            if pid:
+                dj, dh = _google_details(pid, api_key)
                 if debug:
-                    res = (dj.get("result") or {}) if isinstance(dj, dict) else {}
+                    res = dj.get("result") or {}
                     st.session_state.debug.append({
                         "endpoint": "details",
                         "category": category_name,
                         "http_status": dh,
-                        "status": dj.get("status") if isinstance(dj, dict) else "BAD_JSON",
-                        "error_message": dj.get("error_message") if isinstance(dj, dict) else "",
+                        "status": dj.get("status"),
+                        "error_message": dj.get("error_message"),
                         "place_id": pid,
                         "has_phone": bool(res.get("formatted_phone_number") or res.get("international_phone_number")),
                         "has_website": bool(res.get("website"))
                     })
-                if isinstance(dj, dict) and dj.get("status") == "OK":
+                if dj.get("status") == "OK":
                     details = dj.get("result") or {}
 
             tel = details.get("formatted_phone_number") or details.get("international_phone_number") or "-"
@@ -828,45 +809,81 @@ def _google_details_batch(place_ids, api_key, max_workers=10):
             placeholder="Digite (rua, número, bairro, cidade)...",
         )
 
-                # Sugestões estilo Google (aparecem enquanto digita) — estável (sem HTML/JS)
+        # Sugestões estilo Google (aparecem enquanto digita) — estável e bonito
         _q = (st.session_state.get("addr_input") or "").strip()
         st.session_state["addr_last_query"] = _q
         _sugs = get_suggestions_filtered(_q, limit=6) if len(_q) >= 4 else []
         st.session_state["addr_suggestions"] = _sugs
 
-        def _pick_suggestion_from_radio():
-            idx = st.session_state.get("addr_sug_idx")
-            try:
-                idx = int(idx)
-            except Exception:
-                idx = None
-            if idx is None:
-                return
-            sugs = st.session_state.get("addr_suggestions") or []
-            if 0 <= idx < len(sugs):
-                s = sugs[idx]
-                st.session_state["addr_input"] = s
-                st.session_state["addr_hist_sel"] = "(digitar novo)"
+        # CSS (visual “Google-like”)
+        st.markdown(
+            """
+            
+<style>
+  .addr-sug-row{
+    display:flex; gap:10px; align-items:flex-start;
+    padding:10px 12px;
+    border-radius:16px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    margin: 6px 0;
+  }
+  .addr-sug-text{ width:100%; }
+  .addr-sug-main{
+    font-size:0.95rem; line-height:1.25rem;
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+    overflow:hidden;
+  }
+  .addr-sug-sub{
+    margin-top:4px;
+    opacity:0.75;
+    font-size:0.82rem; line-height:1.1rem;
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+    overflow:hidden;
+  }
+  .addr-sug-text b{ font-weight: 800; }
+</style>
+
+            """,
+            unsafe_allow_html=True,
+        )
+
+        def _pick_suggestion(s: str):
+            # Callback (seguro) — preenche o campo e evita sobrescrita pelo histórico
+            st.session_state["addr_input"] = s
+            st.session_state["addr_hist_sel"] = "(digitar novo)"
 
         if _sugs:
-            st.markdown("**📌 Sugestões:**")
-            labels = []
-            for s in _sugs:
-                main_txt, sub_txt = _split_suggestion(s)
-                labels.append(f"{main_txt}\n{sub_txt}" if sub_txt else main_txt)
+            st.markdown("**📌 Sugestões (clique em selecionar):**")
+            for i, s in enumerate(_sugs, start=1):
+                cols = st.columns([0.28, 0.72], gap="small")
+                with cols[0]:
+                    st.button(
+                        "✅ Selecionar",
+                        key=f"sug_pick_{i}",
+                        on_click=_pick_suggestion,
+                        args=(s,),
+                        use_container_width=True,
+                    )
+                    # aplica classe via css selector do container (Streamlit não permite class direta)
+                with cols[1]:
+                    main_txt, sub_txt = _split_suggestion(s)
+                    main_html = _highlight_match(main_txt, _q)
+                    sub_html = _highlight_match(sub_txt, _q) if sub_txt else ""
+                    sub_div = f"<div class='addr-sug-sub'>{sub_html}</div>" if sub_txt else ""
+                    st.markdown(
+                        f"""<div class='addr-sug-row'>
+                               <div class='addr-sug-text'>
+                                 <div class='addr-sug-main'>{main_html}</div>
+                                 {sub_div}
+                               </div>
+                             </div>""",
+                        unsafe_allow_html=True,
+                    )
 
-            st.radio(
-                "Sugestões de endereço",
-                options=list(range(len(labels))),
-                format_func=lambda i: labels[i],
-                key="addr_sug_idx",
-                label_visibility="collapsed",
-                on_change=_pick_suggestion_from_radio,
-            )
             st.caption("Dica: ao clicar em Buscar, se houver sugestões, a 1ª é usada automaticamente.")
 
         radius = st.slider("📏 Raio (km)", 0.5, 10.0, 3.0, 0.5)
-
 
         categories = st.multiselect(
             "🏷️ Categorias",
@@ -1013,10 +1030,140 @@ def _google_details_batch(place_ids, api_key, max_workers=10):
     st.caption("Mapa Comercial por categorias")
 
 
+    if __name__ == "__main__":
+        import sys
+    import subprocess
+    try:
+        from pyngrok import ngrok
+    except Exception:
+        ngrok = None
+
+    
+        # --- CONFIGURAÇÃO NGROK ---
+        # Mude para True se quiser abrir o link para a internet automaticamente
+        MODO_ONLINE = True 
+        NGROK_AUTH_TOKEN = "35RkSd48qM6Ht5KFkZKyoSclZzr_2jn9As8o6P14JCy7hGrzh"
+        # --------------------------
+
+        # Verifica se o script está rodando dentro do contexto do Streamlit
+        try:
+            from streamlit.runtime.scriptrunner import get_script_run_ctx
+            if get_script_run_ctx() is not None:
+                main()
+                sys.exit(0)
+        except ImportError:
+            pass
+
+        # Se chegou aqui, não está no Streamlit. Vamos configurar o lançamento.
+        print("="*50)
+        print("🚀 INICIANDO DASHBOARD SUPLEMEX")
+        print("="*50)
+
+        public_url = None
+        if MODO_ONLINE:
+            if ngrok is None:
+                print("❌ Erro: Biblioteca 'pyngrok' não instalada.")
+                print("👉 Execute: pip install pyngrok")
+            elif NGROK_AUTH_TOKEN == "SEU_TOKEN_AQUI":
+                print("⚠️ Aviso: Você precisa configurar seu NGROK_AUTH_TOKEN no código.")
+                print("👉 Obtenha um em: https://dashboard.ngrok.com/get-started/your-authtoken")
+            else:
+                try:
+                    ngrok.set_auth_token(NGROK_AUTH_TOKEN)
+                    # Porta padrão do Streamlit é 8501
+                    tunnel = ngrok.connect(8501)
+                    public_url = tunnel.public_url
+                    print(f"\n✅ DASHBOARD ONLINE!")
+                    print(f"🔗 Link para compartilhar: {public_url}\n")
+                except Exception as e:
+                    print(f"❌ Erro ao iniciar Ngrok: {e}")
+
+        try:
+            # Comando para rodar o streamlit
+            # Usamos sys.argv[0] para pegar o próprio arquivo
+            cmd = [sys.executable, "-m", "streamlit", "run", sys.argv[0], "--server.port", "8501"]
+        
+            if not MODO_ONLINE:
+                print("\n🏠 Rodando apenas em LOCALHOST (Apenas sua rede local).")
+                print("🔗 Acesse em: http://localhost:8501\n")
+            
+            subprocess.run(cmd)
+        except KeyboardInterrupt:
+            print("\n👋 Encerrando Dashboard...")
+        except Exception as e:
+            print(f"❌ Erro ao iniciar Streamlit: {e}")
+        finally:
+            if public_url:
+                ngrok.disconnect(public_url)
+                ngrok.kill()
+
 
 # ===============================
-# Execução
+# LAUNCHER (Streamlit + Ngrok)
 # ===============================
-
 if __name__ == "__main__":
-    main()
+    # --- CONFIGURAÇÃO NGROK ---
+    # Mude para True se quiser abrir o link para a internet automaticamente
+    MODO_ONLINE = True
+    NGROK_AUTH_TOKEN = "35RkSd48qM6Ht5KFkZKyoSclZzr_2jn9As8o6P14JCy7hGrzh"
+    PORTA_STREAMLIT = 8501
+    # --------------------------
+
+    # Verifica se o script está rodando dentro do contexto do Streamlit
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        if get_script_run_ctx() is not None:
+            main()
+            sys.exit(0)
+    except Exception:
+        pass
+
+    # Se chegou aqui, não está no Streamlit. Vamos configurar o lançamento.
+    print("=" * 60)
+    print("🚀 INICIANDO MAPA COMERCIAL POR CATEGORIAS")
+    print("=" * 60)
+
+    public_url = None
+
+    if MODO_ONLINE:
+        if ngrok is None:
+            print("❌ Erro: Biblioteca 'pyngrok' não instalada (ou dependência faltando).")
+            print("👉 Execute: pip install pyngrok pyyaml")
+        elif NGROK_AUTH_TOKEN.strip() == "" or NGROK_AUTH_TOKEN == "SEU_TOKEN_AQUI":
+            print("⚠️ Aviso: Você precisa configurar seu NGROK_AUTH_TOKEN no código.")
+            print("👉 Obtenha um em: https://dashboard.ngrok.com/get-started/your-authtoken")
+        else:
+            try:
+                ngrok.set_auth_token(NGROK_AUTH_TOKEN)
+                tunnel = ngrok.connect(PORTA_STREAMLIT)
+                public_url = tunnel.public_url
+                print("\n✅ DASHBOARD ONLINE!")
+                print(f"🔗 Link para compartilhar: {public_url}\n")
+            except Exception as e:
+                print(f"❌ Erro ao iniciar Ngrok: {e}")
+                print("👉 Dica: se aparecer 'No module named yaml', rode: pip install pyyaml")
+
+    try:
+        # Comando para rodar o streamlit
+        cmd = [
+            sys.executable, "-m", "streamlit", "run", os.path.abspath(__file__),
+            "--server.port", str(PORTA_STREAMLIT),
+            "--server.headless=false",
+        ]
+
+        if not MODO_ONLINE:
+            print("\n🏠 Rodando apenas em LOCALHOST (Apenas sua rede local).")
+            print(f"🔗 Acesse em: http://localhost:{PORTA_STREAMLIT}\n")
+
+        subprocess.run(cmd)
+    except KeyboardInterrupt:
+        print("\n👋 Encerrando Dashboard...")
+    except Exception as e:
+        print(f"❌ Erro ao iniciar Streamlit: {e}")
+    finally:
+        if public_url and ngrok is not None:
+            try:
+                ngrok.disconnect(public_url)
+                ngrok.kill()
+            except Exception:
+                pass
