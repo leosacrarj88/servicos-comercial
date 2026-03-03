@@ -544,12 +544,43 @@ def _split_endereco_brasil(full: str):
             cidade = p.strip()
             city_idx = parts.index(p)
             break
-
     # 4) Número + Bairro costumam vir no 2º item: "31 - Ipanema" ou "31" ou "31 - Bairro"
-def _apply_num_bairro(segment: str):
-    nonlocal endereco, bairro
-    seg = (segment or "").strip()
-    if not seg:
+    def _apply_num_bairro(segment: str) -> bool:
+        nonlocal endereco, bairro
+        seg = (segment or "").strip()
+        if not seg:
+            return False
+
+        # aceita hífen normal e travessões
+        dash_parts = re.split(r"\s*[-–—]\s*", seg)
+        if len(dash_parts) >= 2:
+            left = " - ".join(dash_parts[:-1]).strip()
+            right = dash_parts[-1].strip()
+
+            # número pode vir como "64", "1.235", ou "64 302" (complemento)
+            mnum = re.match(r"^([\d\.]+)", left)
+            num_raw = (mnum.group(1) if mnum else "").strip()
+            num = re.sub(r"\D", "", num_raw) or num_raw
+
+            # bairro: sempre o último pedaço após o hífen/travessão
+            b = right
+            # se vier "complemento - bairro", pega o ÚLTIMO como bairro
+            if b and (" - " in b):
+                b = b.split(" - ")[-1].strip()
+
+            if num and num not in endereco:
+                endereco = f"{endereco}, {num}".strip().strip(",")
+            if b:
+                bairro = b.strip()
+            return True
+
+        # somente número (com ou sem ponto)
+        if re.fullmatch(r"[\d\.]+", seg):
+            num = seg
+            if num and num not in endereco:
+                endereco = f"{endereco}, {num}".strip().strip(",")
+            return True
+
         return False
 
     # aceita hífen normal e travessões
