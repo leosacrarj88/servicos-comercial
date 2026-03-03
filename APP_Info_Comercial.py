@@ -1139,6 +1139,42 @@ def _gs_apply_contact_columns(ws, max_rows: int = 5000):
     except Exception:
         return
 
+
+
+def _gs_apply_basic_filter(ws, max_rows: int = 5000):
+    """Ativa o filtro (Data -> Criar filtro) na linha de cabeçalho A1:M.
+
+    Isso é o filtro nativo do Google Sheets (BasicFilter). Ajuda a filtrar a base direto na planilha.
+    """
+    try:
+        end_row = int(max_rows)
+        # Limpa filtro existente, se houver
+        try:
+            ws.spreadsheet.batch_update({
+                "requests": [{"clearBasicFilter": {"sheetId": ws.id}}]
+            })
+        except Exception:
+            pass
+
+        ws.spreadsheet.batch_update({
+            "requests": [{
+                "setBasicFilter": {
+                    "filter": {
+                        "range": {
+                            "sheetId": ws.id,
+                            "startRowIndex": 0,       # inclui header
+                            "endRowIndex": end_row,   # exclusivo
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 13      # A..M
+                        }
+                    }
+                }
+            }]
+        })
+    except Exception:
+        return
+
+
 def _ensure_gsheet_headers(ws):
     """
     Headers alvo (A1:M1) — BASE ZERADA:
@@ -1173,7 +1209,7 @@ def _gs_apply_row_rules(ws, max_rows: int = 5000):
                 sheet = s
                 break
 
-        existing_rules = (sheet or {}).get("conditionalFormats") or []
+        existing_rules = (sheet or {}).get("conditionalFormats") or (sheet or {}).get("conditionalFormatsRules") or (sheet or {}).get("conditionalFormatRules") or []
         if existing_rules:
             # deletar do fim pro começo
             reqs = []
@@ -1263,6 +1299,7 @@ def export_results_incremental_gsheet(
 
     _ensure_gsheet_headers(ws)
     _gs_apply_contact_columns(ws)
+    _gs_apply_basic_filter(ws)
     _gs_apply_row_rules(ws)
 
     if updated_dt is None:
