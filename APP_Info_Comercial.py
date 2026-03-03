@@ -547,26 +547,42 @@ def _split_endereco_brasil(full: str):
 
     # 4) Número + Bairro costumam vir no 2º item: "31 - Ipanema" ou "31" ou "31 - Bairro"
     def _apply_num_bairro(segment: str):
-        nonlocal endereco, bairro
-        seg = segment.strip()
-        mnb = re.match(r"^([\d\.]+)\s*-\s*(.+)$", seg)
-        if mnb:
-            num_raw = mnb.group(1).strip()
-            num = re.sub(r"\D", "", num_raw) or num_raw
-            rest = mnb.group(2).strip()
-            # quando vier "num - complemento - bairro", pega o ÚLTIMO como bairro
-            b = rest.split(" - ")[-1].strip() if " - " in rest else rest
-            if num and num not in endereco:
-                endereco = f"{endereco}, {num}".strip().strip(",")
-            if not bairro and b:
-                bairro = b
-            return True
-        if re.fullmatch(r"[\d\.]+", seg):
-            num = seg
-            if num and num not in endereco:
-                endereco = f"{endereco}, {num}".strip().strip(",")
-            return True
+    nonlocal endereco, bairro
+    seg = (segment or "").strip()
+    if not seg:
         return False
+
+    # aceita hífen normal e travessões
+    dash_parts = re.split(r"\s*[-–—]\s*", seg)
+    if len(dash_parts) >= 2:
+        left = " - ".join(dash_parts[:-1]).strip()
+        right = dash_parts[-1].strip()
+
+        # número pode vir como "64", "1.235", ou "64 302" (complemento)
+        mnum = re.match(r"^([\d\.]+)", left)
+        num_raw = (mnum.group(1) if mnum else "").strip()
+        num = re.sub(r"\D", "", num_raw) or num_raw
+
+        # bairro: sempre o último pedaço após o hífen/travessão
+        b = right
+        # se vier "complemento - bairro", pega o ÚLTIMO como bairro
+        if b and (" - " in b):
+            b = b.split(" - ")[-1].strip()
+
+        if num and num not in endereco:
+            endereco = f"{endereco}, {num}".strip().strip(",")
+        if not bairro and b:
+            bairro = b
+        return True
+
+    # somente número (com ou sem ponto)
+    if re.fullmatch(r"[\d\.]+", seg):
+        num = seg
+        if num and num not in endereco:
+            endereco = f"{endereco}, {num}".strip().strip(",")
+        return True
+
+    return False
 
     if len(parts) >= 2:
         # se parts[1] é número/bairro, aplica
@@ -1144,15 +1160,24 @@ def _gs_apply_contact_columns(ws, max_rows: int = 5000):
 def _gs_apply_basic_filter(ws, max_rows: int = 5000):
     """Ativa o filtro (Data -> Criar filtro) na linha de cabeçalho A1:M.
 
-    Isso é o filtro nativo do Google Sheets (BasicFilter). Ajuda a filtrar a base direto na planilha.
+    No Google Sheets API, o range do filtro precisa estar dentro do tamanho atual da planilha.
+    Por isso usamos ws.row_count/ws.col_count e fazemos resize mínimo para 13 colunas.
     """
     try:
-        end_row = int(max_rows)
+        # garante pelo menos 13 colunas (A..M)
+        try:
+            if int(getattr(ws, "col_count", 0) or 0) < 13:
+                ws.resize(cols=13)
+        except Exception:
+            pass
+
+        end_row = int(getattr(ws, "row_count", 0) or 0)
+        if end_row < 2:
+            end_row = 2  # header + 1 linha
+
         # Limpa filtro existente, se houver
         try:
-            ws.spreadsheet.batch_update({
-                "requests": [{"clearBasicFilter": {"sheetId": ws.id}}]
-            })
+            ws.spreadsheet.batch_update({"requests": [{"clearBasicFilter": {"sheetId": ws.id}}]})
         except Exception:
             pass
 
@@ -1162,10 +1187,10 @@ def _gs_apply_basic_filter(ws, max_rows: int = 5000):
                     "filter": {
                         "range": {
                             "sheetId": ws.id,
-                            "startRowIndex": 0,       # inclui header
-                            "endRowIndex": end_row,   # exclusivo
+                            "startRowIndex": 0,
+                            "endRowIndex": end_row,
                             "startColumnIndex": 0,
-                            "endColumnIndex": 13      # A..M
+                            "endColumnIndex": 13
                         }
                     }
                 }
@@ -1184,6 +1209,14 @@ def _ensure_gsheet_headers(ws):
     expected = _GS_EXPORT_HEADERS
     expected_norm = [_gs_norm(x) for x in expected]
 
+    # garante tamanho mínimo (A..M)
+    try:
+        if int(getattr(ws, 'col_count', 0) or 0) < 13:
+            ws.resize(cols=13)
+    except Exception:
+        pass
+
+
     # lê A1:M1
     cur = [ws.cell(1, c).value for c in range(1, 14)]
     cur_norm = [_gs_norm(x) for x in cur]
@@ -1196,42 +1229,54 @@ def _ensure_gsheet_headers(ws):
 def _gs_apply_row_rules(ws, max_rows: int = 5000):
     """
     Regras de formatação condicional (linha inteira A..M):
-    - Verde claro quando "Já fiz contato?" for TRUE
-    - Vermelho quando "Executiva Pixel" tiver valor diferente de "Vanessa" (e não vazio)
+    - Verde claro quando "Já fiz contato?" (coluna F) for TRUE
+    - Vermelho quando "Executiva Pixel" (coluna B) tiver valor diferente de "Vanessa" (e não vazio)
+
+    No Cloud, ranges fora do tamanho da planilha causam erro 400 e nada é aplicado.
+    Então usamos ws.row_count e garantimos 13 colunas.
     """
     try:
-        # Remove regras existentes dessa aba (base zerada → podemos limpar com segurança)
-        meta = ws.spreadsheet.fetch_sheet_metadata()
-        sheet = None
-        for s in (meta.get("sheets") or []):
-            props = (s.get("properties") or {})
-            if props.get("sheetId") == ws.id:
-                sheet = s
-                break
+        # garante pelo menos 13 colunas (A..M)
+        try:
+            if int(getattr(ws, "col_count", 0) or 0) < 13:
+                ws.resize(cols=13)
+        except Exception:
+            pass
 
-        existing_rules = (sheet or {}).get("conditionalFormats") or (sheet or {}).get("conditionalFormatsRules") or (sheet or {}).get("conditionalFormatRules") or []
+        end_row = int(getattr(ws, "row_count", 0) or 0)
+        if end_row < 2:
+            end_row = 2
+
+        # tenta buscar regras existentes (com fields explícitos)
+        existing_rules = []
+        try:
+            meta = ws.spreadsheet.fetch_sheet_metadata(params={"fields": "sheets(properties,conditionalFormats)"})
+            sheet = None
+            for s in (meta.get("sheets") or []):
+                props = (s.get("properties") or {})
+                if props.get("sheetId") == ws.id:
+                    sheet = s
+                    break
+            existing_rules = (sheet or {}).get("conditionalFormats") or []
+        except Exception:
+            existing_rules = []
+
+        # remove regras existentes (do fim pro começo)
         if existing_rules:
-            # deletar do fim pro começo
             reqs = []
             for idx in range(len(existing_rules) - 1, -1, -1):
-                reqs.append({
-                    "deleteConditionalFormatRule": {
-                        "sheetId": ws.id,
-                        "index": idx
-                    }
-                })
-            ws.spreadsheet.batch_update({"requests": reqs})
+                reqs.append({"deleteConditionalFormatRule": {"sheetId": ws.id, "index": idx}})
+            if reqs:
+                ws.spreadsheet.batch_update({"requests": reqs})
 
-        # Range: linhas 2..max_rows, colunas A..M
         rng = {
             "sheetId": ws.id,
-            "startRowIndex": 1,
-            "endRowIndex": int(max_rows),
+            "startRowIndex": 1,      # começa na linha 2 (0-based)
+            "endRowIndex": end_row,  # exclusivo
             "startColumnIndex": 0,
             "endColumnIndex": 13
         }
 
-        # 1) Verde claro (prioridade maior)
         green_rule = {
             "addConditionalFormatRule": {
                 "index": 0,
@@ -1242,15 +1287,12 @@ def _gs_apply_row_rules(ws, max_rows: int = 5000):
                             "type": "CUSTOM_FORMULA",
                             "values": [{"userEnteredValue": "=$F2=TRUE"}]
                         },
-                        "format": {
-                            "backgroundColor": {"red": 0.85, "green": 0.95, "blue": 0.85}
-                        }
+                        "format": {"backgroundColor": {"red": 0.85, "green": 0.95, "blue": 0.85}}
                     }
                 }
             }
         }
 
-        # 2) Vermelho (Executiva Pixel != Vanessa e != vazio)
         red_rule = {
             "addConditionalFormatRule": {
                 "index": 1,
@@ -1261,9 +1303,7 @@ def _gs_apply_row_rules(ws, max_rows: int = 5000):
                             "type": "CUSTOM_FORMULA",
                             "values": [{"userEnteredValue": "=AND($B2<>\"\",$B2<>\"Vanessa\")"}]
                         },
-                        "format": {
-                            "backgroundColor": {"red": 0.98, "green": 0.82, "blue": 0.82}
-                        }
+                        "format": {"backgroundColor": {"red": 0.98, "green": 0.82, "blue": 0.82}}
                     }
                 }
             }
@@ -1608,7 +1648,7 @@ def main():
     # ===============================
     CATEGORIES_CONFIG = {
         "🛒 Mercados": {"google_type": "supermarket", "osm": ["shop=supermarket", "shop=convenience", "shop=grocery"]},
-        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual","municipal","ciep","CIEP"]},
+        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual"]},
         "🏫 Faculdades/Universidades": {"google_type": "school", "osm": ["amenity=university"]},
         # "🏗️ Construtoras": {"google_type": "general_contractor", "osm": ["office=construction", "craft=builder", "office=architect"]},
         "🏥 Hospitais": {"google_type": "hospital", "osm": ["amenity=hospital", "amenity=clinic", "amenity=doctors"]},
