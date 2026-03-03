@@ -547,12 +547,12 @@ def _split_endereco_brasil(full: str):
     # 4) Número + Bairro costumam vir no 2º item: "31 - Ipanema" ou "31" ou "31 - Bairro"
     def _apply_num_bairro(segment: str) -> bool:
         nonlocal endereco, bairro
-        seg = (segment or "").strip()
-        if not seg:
+        seg_txt = (segment or "").strip()
+        if not seg_txt:
             return False
 
         # aceita hífen normal e travessões
-        dash_parts = re.split(r"\s*[-–—]\s*", seg)
+        dash_parts = re.split(r"\s*[-–—]\s*", seg_txt)
         if len(dash_parts) >= 2:
             left = " - ".join(dash_parts[:-1]).strip()
             right = dash_parts[-1].strip()
@@ -575,8 +575,8 @@ def _split_endereco_brasil(full: str):
             return True
 
         # somente número (com ou sem ponto)
-        if re.fullmatch(r"[\d\.]+", seg):
-            num = seg
+        if re.fullmatch(r"[\d\.]+", seg_txt):
+            num = seg_txt_txt
             if num and num not in endereco:
                 endereco = f"{endereco}, {num}".strip().strip(",")
             return True
@@ -584,7 +584,7 @@ def _split_endereco_brasil(full: str):
         return False
 
     # aceita hífen normal e travessões
-    dash_parts = re.split(r"\s*[-–—]\s*", seg)
+    dash_parts = re.split(r"\s*[-–—]\s*", seg_txt)
     if len(dash_parts) >= 2:
         left = " - ".join(dash_parts[:-1]).strip()
         right = dash_parts[-1].strip()
@@ -607,8 +607,8 @@ def _split_endereco_brasil(full: str):
         return True
 
     # somente número (com ou sem ponto)
-    if re.fullmatch(r"[\d\.]+", seg):
-        num = seg
+    if re.fullmatch(r"[\d\.]+", seg_txt):
+        num = seg_txt_txt
         if num and num not in endereco:
             endereco = f"{endereco}, {num}".strip().strip(",")
         return True
@@ -903,7 +903,6 @@ def export_results_incremental_xlsx(
 
     for _, row in df.iterrows():
         segmento = str(_pick_row_value(row, ["Categoria", "Segmento"])).strip()
-        seg = segmento  # compat: evita NameError caso algum trecho antigo use `seg`
         cliente = str(_pick_row_value(row, ["Nome", "Cliente", "Estabelecimento", "Nome do estabelecimento"])).strip()
 
         # Contato robusto (telefones + sociais + site) e e-mail quando existir
@@ -942,9 +941,9 @@ def export_results_incremental_xlsx(
     # Ordenar por Segmento (Apenas colunas do schema) - deixa a planilha organizada
     try:
         if added > 0:
-            seg_col = cols.get("Segmento")
-            if seg_col:
-                last_row = _last_filled_row_any(ws, header_row, [cols.get("Cliente"), cols.get("Contato"), seg_col])
+            seg_col_idx = cols.get("Segmento")
+            if seg_col_idx:
+                last_row = _last_filled_row_any(ws, header_row, [cols.get("Cliente"), cols.get("Contato"), seg_col_idx])
                 data_rows = []
                 for r in range(header_row + 1, last_row + 1):
                     row_vals = [ws.cell(r, cols[h]).value if cols.get(h) else None for h in _EXPORT_REQUIRED_HEADERS]
@@ -1737,7 +1736,7 @@ def main():
         must = [str(x).strip().lower() for x in (cfg.get("name_must_contain") or []) if str(x).strip()]
         must_extra = [str(x).strip().lower() for x in (cfg.get("name_must_contain_extra_any") or []) if str(x).strip()]
         excl = [str(x).strip().lower() for x in (cfg.get("name_exclude") or []) if str(x).strip()]
-        seg_any = [str(x).strip().lower() for x in (cfg.get("segment_name_any") or []) if str(x).strip()]
+        seg_terms = [str(x).strip().lower( for x in (cfg.get("segment_name_any") or []) if str(x).strip()]
         conditional_requires = cfg.get("conditional_requires") or []
         if not must and not must_extra and not excl:
             return rows
@@ -1748,7 +1747,7 @@ def main():
 
             if must and not any(t in nm for t in must):
                 # fallback genérico do segmento (ex.: 'stand de vendas' em Construtoras)
-                if not (seg_any and any(t in nm for t in seg_any)):
+                if not (seg_terms and any(t in nm for t in seg_terms)):
                     continue
             if must_extra and not any(t in nm for t in must_extra):
                 continue
@@ -2996,7 +2995,7 @@ def _run_streamlit_from_python():
     print(f"🔗 URL: http://127.0.0.1:{port}")
     print("=" * 60)
     # Bloqueia no processo do Streamlit (CTRL+C para parar)
-    subprocess.run(args)
+    # subprocess.run(args)
 
 
 if __name__ == "__main__":
