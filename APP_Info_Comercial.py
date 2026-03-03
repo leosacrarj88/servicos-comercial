@@ -549,9 +549,10 @@ def _split_endereco_brasil(full: str):
     def _apply_num_bairro(segment: str):
         nonlocal endereco, bairro
         seg = segment.strip()
-        mnb = re.match(r"^(\d+)\s*-\s*(.+)$", seg)
+        mnb = re.match(r"^([\d\.]+)\s*-\s*(.+)$", seg)
         if mnb:
-            num = mnb.group(1).strip()
+            num_raw = mnb.group(1).strip()
+            num = re.sub(r"\D", "", num_raw) or num_raw
             rest = mnb.group(2).strip()
             # quando vier "num - complemento - bairro", pega o ÚLTIMO como bairro
             b = rest.split(" - ")[-1].strip() if " - " in rest else rest
@@ -560,7 +561,7 @@ def _split_endereco_brasil(full: str):
             if not bairro and b:
                 bairro = b
             return True
-        if re.fullmatch(r"\d+", seg):
+        if re.fullmatch(r"[\d\.]+", seg):
             num = seg
             if num and num not in endereco:
                 endereco = f"{endereco}, {num}".strip().strip(",")
@@ -1570,7 +1571,7 @@ def main():
     # ===============================
     CATEGORIES_CONFIG = {
         "🛒 Mercados": {"google_type": "supermarket", "osm": ["shop=supermarket", "shop=convenience", "shop=grocery"]},
-        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual","municipal","ciep","CIEP"]},
+        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual"]},
         "🏫 Faculdades/Universidades": {"google_type": "school", "osm": ["amenity=university"]},
         # "🏗️ Construtoras": {"google_type": "general_contractor", "osm": ["office=construction", "craft=builder", "office=architect"]},
         "🏥 Hospitais": {"google_type": "hospital", "osm": ["amenity=hospital", "amenity=clinic", "amenity=doctors"]},
@@ -2561,6 +2562,18 @@ def main():
                 st.session_state.last_error = "⚠️ Nenhum resultado encontrado. (Se for Google e estiver tudo 'REQUEST_DENIED', verifique billing/restrições/Places API)."
             else:
                 df = pd.DataFrame(all_rows)
+
+                # Filtro por palavra-chave (local): garante que funciona também no OSM e após o filtro de categoria
+                if keyword:
+                    kw = str(keyword).strip().lower()
+                    if kw:
+                        def _row_match_kw(r):
+                            try:
+                                return (kw in str(r.get("Nome","")).lower()) or (kw in str(r.get("Endereço","")).lower())
+                            except Exception:
+                                return False
+                        df = df[df.apply(_row_match_kw, axis=1)].copy()
+
 
                 df["Distância (km)"] = df.apply(lambda r: haversine_km(lat, lon, r["Latitude"], r["Longitude"]), axis=1).astype(float).round(2)
 
