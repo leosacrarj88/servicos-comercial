@@ -69,7 +69,7 @@ _GS_EXPORT_HEADERS = ["Segmento", "Executiva Pixel", "Empresa (Cliente)", "Respo
 # ===============================
 # Se vazio/None, aceita qualquer UF.
 # Exemplo para restringir: ALLOWED_UF = {"RJ", "SP"}
-ALLOWED_UF = set()  # type: set[str]
+ALLOWED_UF: dict[str, str] = {"RJ": "Rio de Janeiro"}  # UF -> nome do estado (edite conforme necessário)
 
 import subprocess
 import socket
@@ -1280,7 +1280,7 @@ def export_results_incremental_gsheet(
             cliente0 = (r[2] if len(r) > 2 else "").strip()
             contato0 = (r[4] if len(r) > 4 else "").strip()
             email0 = (r[8] if len(r) > 8 else "").strip()
-            endereco0 = (r[9] if len(r) > 9 else "").strip() > 7 else "").strip()
+            endereco0 = (r[9] if len(r) > 9 else "").strip()
             key = _dedup_key(cliente0, contato0, email0, endereco0)
             if key != ("", ""):
                 existing.add(key)
@@ -1316,14 +1316,17 @@ def export_results_incremental_gsheet(
 
     return {"added": len(rows_to_append), "skipped": skipped, "spreadsheet_id": spreadsheet_id, "worksheet": worksheet_name}
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def nominatim_suggest(query: str, limit: int = 6) -> list[dict]:
     """
-    Busca sugestões no Nominatim (OSM).
-    Retorna uma lista de dicts com display_name + address details.
+    Busca sugestões no Nominatim (OSM) para autocomplete.
+    Cloud-safe: não quebra em 403/429 (rate-limit) e usa User-Agent completo.
+    Retorna lista de dicts (jsonv2).
     """
     q = (query or "").strip()
     if len(q) < 4:
         return []
+
     url = "https://nominatim.openstreetmap.org/search"
     params = {
         "format": "jsonv2",
@@ -1332,33 +1335,93 @@ def nominatim_suggest(query: str, limit: int = 6) -> list[dict]:
         "limit": int(limit),
         "countrycodes": "br",
     }
-    headers = {"User-Agent": "SuplemexApp/1.0 (streamlit)"}
+    headers = {
+        "User-Agent": "InfoComerciais/1.0 (streamlit; contact: vanessa@pixelretail.com.br)",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    }
+
     try:
         r = requests.get(url, params=params, headers=headers, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, list):
+        # 429/403 acontecem no Cloud (IP compartilhado). Não quebrar: apenas retornar vazio.
+        if r.status_code >= 400:
             return []
-        return data
+        data = r.json()
+        return data if isinstance(data, list) else []
     except Exception:
         return []
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def photon_suggest(query: str, limit: int = 6) -> list[dict]:
+    """
+    Fallback de sugestões via Photon (Komoot).
+    Retorna uma lista de dicts no formato do Photon (features).
+    """
+    q = (query or "").strip()
+    if len(q) < 4:
+        return []
+    url = "https://photon.komoot.io/api/"
+    params = {
+        "q": q,
+        "limit": int(limit),
+        "lang": "pt",
+        "osm_tag": "place",   # ajuda a reduzir lixo
+    }
+    headers = {
+        "User-Agent": "InfoComerciais/1.0 (streamlit; contact: vanessa@pixelretail.com.br)",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    }
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        if r.status_code >= 400:
+            return []
+        data = r.json()
+        feats = (data or {}).get("features") or []
+        return feats if isinstance(feats, list) else []
+    except Exception:
+        return []
+
+
 def _uf_allowed_for_result(res: dict) -> bool:
+    """
+    Filtra resultados para estados permitidos.
+    ALLOWED_UF deve ser um dict UF->Nome do estado (ex.: {"RJ":"Rio de Janeiro"}).
+    Se ALLOWED_UF estiver vazio, aceita tudo.
+    """
     if not ALLOWED_UF:
         return True
     try:
-        addr = res.get("address") or {}
-        state = (addr.get("state") or "").strip()
-        # aceita se o estado bater com algum permitido
         allowed_states = set((v or "").strip().lower() for v in ALLOWED_UF.values())
-        return (state.lower() in allowed_states) or any(a in state.lower() for a in allowed_states)
+
+        # Nominatim: {"address":{"state":...}}
+        addr = res.get("address") if isinstance(res.get("address"), dict) else {}
+        state = (addr.get("state") or "").strip().lower()
+
+        # Photon: {"properties":{"state":...}}
+        if not state:
+            props = res.get("properties") if isinstance(res.get("properties"), dict) else {}
+            state = (props.get("state") or "").strip().lower()
+
+        if not state:
+            return False
+
+        return (state in allowed_states) or any(a in state for a in allowed_states)
     except Exception:
         return False
 
+
 def get_suggestions_filtered(query: str, limit: int = 6) -> list[str]:
-    raw = nominatim_suggest(query, limit=limit)
+    """
+    Retorna sugestões (strings) já filtradas por UF/estado.
+    Estratégia:
+      1) Nominatim
+      2) Photon fallback (caso Nominatim esteja rate-limited)
+    """
     out: list[str] = []
-    for r in raw:
+
+    # 1) Nominatim
+    raw1 = nominatim_suggest(query, limit=limit)
+    for r in raw1:
         if not isinstance(r, dict):
             continue
         if not _uf_allowed_for_result(r):
@@ -1366,9 +1429,40 @@ def get_suggestions_filtered(query: str, limit: int = 6) -> list[str]:
         dn = (r.get("display_name") or "").strip()
         if dn:
             out.append(dn)
+
+    # 2) Photon (fallback)
+    if not out:
+        raw2 = photon_suggest(query, limit=limit)
+        for f in raw2:
+            if not isinstance(f, dict):
+                continue
+            if not _uf_allowed_for_result(f):
+                continue
+            props = f.get("properties") if isinstance(f.get("properties"), dict) else {}
+            name = (props.get("name") or "").strip()
+            street = (props.get("street") or "").strip()
+            housenumber = (props.get("housenumber") or "").strip()
+            city = (props.get("city") or props.get("town") or props.get("village") or "").strip()
+            state = (props.get("state") or "").strip()
+            postcode = (props.get("postcode") or "").strip()
+            parts = []
+            if street:
+                parts.append(f"{street}{', ' + housenumber if housenumber else ''}")
+            elif name:
+                parts.append(name)
+            if city:
+                parts.append(city)
+            if state:
+                parts.append(state)
+            if postcode:
+                parts.append(postcode)
+            dn = ", ".join([p for p in parts if p])
+            if dn:
+                out.append(dn)
+
     # remove duplicados preservando ordem
     seen = set()
-    uniq = []
+    uniq: list[str] = []
     for s in out:
         k = s.lower()
         if k in seen:
@@ -1476,7 +1570,7 @@ def main():
     # ===============================
     CATEGORIES_CONFIG = {
         "🛒 Mercados": {"google_type": "supermarket", "osm": ["shop=supermarket", "shop=convenience", "shop=grocery"]},
-        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual"]},
+        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual","municipal","ciep","CIEP"]},
         "🏫 Faculdades/Universidades": {"google_type": "school", "osm": ["amenity=university"]},
         # "🏗️ Construtoras": {"google_type": "general_contractor", "osm": ["office=construction", "craft=builder", "office=architect"]},
         "🏥 Hospitais": {"google_type": "hospital", "osm": ["amenity=hospital", "amenity=clinic", "amenity=doctors"]},
@@ -2780,7 +2874,7 @@ def _run_streamlit_from_python():
     print(f"🔗 URL: http://127.0.0.1:{port}")
     print("=" * 60)
     # Bloqueia no processo do Streamlit (CTRL+C para parar)
-    # subprocess.run(args)
+    subprocess.run(args)
 
 
 if __name__ == "__main__":
