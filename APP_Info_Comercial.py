@@ -2964,7 +2964,7 @@ def _run_streamlit_from_python():
     print(f"🔗 URL: http://127.0.0.1:{port}")
     print("=" * 60)
     # Bloqueia no processo do Streamlit (CTRL+C para parar)
-    subprocess.run(args)
+    # subprocess.run(args)
 
 
 if __name__ == "__main__":
