@@ -100,43 +100,1251 @@ except Exception:
 
 
 # ===============================
+# HISTÓRICO DE ENDEREÇOS (JSON)
+# - Salva/Carrega um arquivo JSON na mesma pasta do app/exec
+# - Mantém uma lista de endereços recentes para reuso
+# ===============================
 
-# ===============================
-# HISTÓRICO DE ENDEREÇOS (CLOUD-SAFE)
-# - Sem arquivo local (Streamlit Cloud não garante persistência em disco)
-# - Mantém histórico somente na sessão (st.session_state)
-# ===============================
+def _app_base_dir() -> str:
+    """Pasta onde o app deve salvar arquivos (mesma pasta do .py ou do executável)."""
+    try:
+        if getattr(sys, "frozen", False):  # PyInstaller / exe
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        # fallback: pasta atual do processo
+        return os.getcwd()
+
+
+def _addr_history_path() -> str:
+    return os.path.join(_app_base_dir(), "historico_enderecos.json")
+
 
 def load_address_history(limit: int = 25) -> list[str]:
-    hist = st.session_state.get("address_history") or []
-    if not isinstance(hist, list):
-        hist = []
-    out=[]
-    seen=set()
-    for x in hist:
-        if not isinstance(x, str):
-            continue
-        s=x.strip()
-        if not s:
-            continue
-        k=s.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(s)
-        if len(out) >= max(1, int(limit)):
-            break
-    return out
+    """Retorna lista de endereços (mais recentes primeiro)."""
+    fp = _addr_history_path()
+    try:
+        if not os.path.exists(fp):
+            return []
+        data = json.loads(Path(fp).read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            data = data.get("enderecos", [])
+        if not isinstance(data, list):
+            return []
+        out = []
+        for x in data:
+            if isinstance(x, str):
+                s = x.strip()
+                if s:
+                    out.append(s)
+        # remove duplicados mantendo ordem
+        seen = set()
+        uniq = []
+        for s in out:
+            k = s.lower()
+            if k not in seen:
+                uniq.append(s)
+                seen.add(k)
+        return uniq[: max(1, limit)]
+    except Exception:
+        return []
+
+
+def save_address_history(addresses: list[str]) -> None:
+    fp = _addr_history_path()
+    try:
+        payload = {"enderecos": addresses}
+        Path(fp).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        # não pode quebrar o app por falha de IO
+        return
+
 
 def add_address_to_history(addr: str, limit: int = 25) -> None:
-    a=(addr or "").strip()
+    a = (addr or "").strip()
     if not a:
         return
     hist = load_address_history(limit=limit)
-    new_hist = [a] + [x for x in hist if x.lower() != a.lower()]
-    st.session_state["address_history"] = new_hist[:max(1, int(limit))]
+    # coloca no topo, removendo duplicados
+    new_hist = [a] + [x for x in hist if x.strip().lower() != a.lower()]
+    save_address_history(new_hist[: max(1, limit)])
 
-ALLOWED_UF:
+
+
+# ===============================
+# EXPORTAÇÃO PARA EXCEL (Incremental)
+# ===============================
+EXPORT_TEMPLATE_FILENAME = "Prospecção Vanessa Pixel Rio.xlsx"
+DEFAULT_EXPORT_SHEET_NAME = "Moinho clientes"
+
+_EXPORT_REQUIRED_HEADERS = ["Segmento", "Cliente", "Responsável", "Contato", "Já fiz contato?", "Data de contato", "E-mail", "Endereço", "CEP", "Atualizado em", "Executiva"]
+def _norm_header(v) -> str:
+    if v is None:
+        return ""
+    return str(v).strip().lower()
+
+
+def _first_empty_header_col(ws, header_row: int, start_col: int = 1, end_col: int = 20):
+    """
+    Encontra a 1ª coluna (no header_row) cujo header está vazio.
+    Importante: evita criar colunas novas lá no fim da planilha (muitas têm formatação até colunas bem à direita).
+    """
+    for c in range(start_col, end_col + 1):
+        v = ws.cell(header_row, c).value
+        if v is None or str(v).strip() == "":
+            return c
+    return None
+
+
+def _find_header_row(ws, scan_rows=30, scan_cols=60):
+    # considera "achou" se pelo menos Segmento e Cliente estão na mesma linha
+    for r in range(1, scan_rows + 1):
+        row_vals = [_norm_header(ws.cell(r, c).value) for c in range(1, scan_cols + 1)]
+        if ("segmento" in row_vals) and ("cliente" in row_vals):
+            # guarda todas as colunas (inclusive duplicadas) por header
+            all_cols = {}
+            for c, v in enumerate(row_vals, start=1):
+                if v:
+                    all_cols.setdefault(v, []).append(c)
+            return r, all_cols
+    return None, None
+
+
+def _ensure_export_layout(ws):
+    """
+    Garante que a aba tenha os headers:
+    Segmento | Executiva | Endereço origem | Cliente | Endereço | Responsável | Contato | Atualizado em
+    E tenta manter tudo em colunas visíveis (A..T), mesmo que a planilha tenha
+    formatação até colunas muito à direita.
+    """
+    header_row, all_cols = _find_header_row(ws)
+
+    # Se não achou header: cria do zero
+    if header_row is None:
+        header_row = 1
+        for i, h in enumerate(_EXPORT_REQUIRED_HEADERS, start=1):
+            ws.cell(header_row, i).value = h
+        all_cols = {_norm_header(h): [i] for i, h in enumerate(_EXPORT_REQUIRED_HEADERS, start=1)}
+
+    # Layout específico da sua planilha anexa (aba "Moinho clientes"):
+    # Coluna 2 vem "Responsável" mas na prática é "Executiva" (valor "Vanessa")
+    # Coluna 4 vem "Responsável " (com espaço).
+    v2 = _norm_header(ws.cell(header_row, 2).value)
+    v4 = _norm_header(ws.cell(header_row, 4).value)
+    if v2 in ("responsável", "responsavel") and v4 in ("responsável", "responsavel"):
+        ws.cell(header_row, 2).value = "Executiva"
+        ws.cell(header_row, 4).value = "Responsável"
+        # atualiza all_cols de forma consistente
+        all_cols.setdefault("executiva", [2])
+        all_cols["executiva"] = [2]
+        all_cols.setdefault("responsável", [4])
+        all_cols["responsável"] = [4]
+        all_cols["responsavel"] = [4]
+
+        # Se a planilha estiver no formato antigo (sem Endereço origem), insere 1 coluna logo após "Executiva"
+    # para manter "Endereço origem" AO LADO de "Executiva" (como você pediu).
+    try:
+        has_exec = "executiva" in (all_cols or {})
+        has_origin = ("endereço origem" in (all_cols or {})) or ("endereco origem" in (all_cols or {}))
+        if has_exec and (not has_origin):
+            exec_col = (all_cols.get("executiva") or [None])[0]
+            if isinstance(exec_col, int) and exec_col > 0:
+                target_col = int(exec_col) + 1
+                ws.insert_cols(target_col, 1)
+                ws.cell(header_row, target_col).value = "Endereço origem"
+
+                # Reconstroi o mapa de headers após o insert
+                all_cols = {}
+                for c in range(1, 61):
+                    v = _norm_header(ws.cell(header_row, c).value)
+                    if v:
+                        all_cols.setdefault(v, []).append(c)
+    except Exception:
+        pass
+
+# Se a planilha ainda estiver no formato antigo (sem Endereço), insere uma coluna logo após "Cliente"
+    # para garantir que "Endereço" fique AO LADO de "Cliente" (como você pediu).
+    try:
+        has_cliente = "cliente" in (all_cols or {})
+        has_end = ("endereço" in (all_cols or {})) or ("endereco" in (all_cols or {}))
+        if has_cliente and (not has_end):
+            cliente_col = (all_cols.get("cliente") or [None])[0]
+            if isinstance(cliente_col, int) and cliente_col > 0:
+                target_col = int(cliente_col) + 1
+                ws.insert_cols(target_col, 1)
+                ws.cell(header_row, target_col).value = "Endereço"
+
+                # Reconstroi o mapa de headers após o insert (porque as colunas mudaram)
+                all_cols = {}
+                for c in range(1, 61):
+                    v = _norm_header(ws.cell(header_row, c).value)
+                    if v:
+                        all_cols.setdefault(v, []).append(c)
+    except Exception:
+        pass
+
+    # Monta mapa final header->col (preferindo colunas mais à esquerda)
+    def _pick_col(h_norm: str):
+        cols = (all_cols or {}).get(h_norm) or []
+        return cols[0] if cols else None
+
+    # "Responsável" pode vir com ou sem acento
+    resp_col = _pick_col("responsável") or _pick_col("responsavel")
+
+    cols = {
+        "Segmento": _pick_col("segmento"),
+        "Executiva": _pick_col("executiva"),
+        "Endereço origem": _pick_col("endereço origem") or _pick_col("endereco origem"),
+        "Cliente": _pick_col("cliente"),
+        "Endereço": _pick_col("endereço") or _pick_col("endereco"),
+        "Responsável": resp_col,
+        "Contato": _pick_col("contato"),
+        "Atualizado em": _pick_col("atualizado em"),
+    }
+
+    # Garante headers faltantes usando primeira coluna vazia (A..T) antes de "jogar" para o fim
+    def _ensure_header(title: str):
+        hn = _norm_header(title)
+        if hn in ("responsável", "responsavel"):
+            if cols["Responsável"] is not None:
+                return cols["Responsável"]
+        if hn == "executiva" and cols["Executiva"] is not None:
+            return cols["Executiva"]
+        if hn in ("endereço origem", "endereco origem") and cols.get("Endereço origem") is not None:
+            return cols["Endereço origem"]
+        if hn == "segmento" and cols["Segmento"] is not None:
+            return cols["Segmento"]
+        if hn == "cliente" and cols["Cliente"] is not None:
+            return cols["Cliente"]
+        if hn in ("endereço", "endereco") and cols.get("Endereço") is not None:
+            return cols["Endereço"]
+        if hn == "contato" and cols["Contato"] is not None:
+            return cols["Contato"]
+        if hn == "atualizado em" and cols["Atualizado em"] is not None:
+            return cols["Atualizado em"]
+
+        c = _first_empty_header_col(ws, header_row, 1, 20)
+        if c is None:
+            # fallback: após o último header não-vazio até col 60; senão, max_column+1
+            last_h = 0
+            for cc in range(1, 61):
+                vv = ws.cell(header_row, cc).value
+                if vv is not None and str(vv).strip() != "":
+                    last_h = cc
+            c = last_h + 1 if last_h else (ws.max_column or 1) + 1
+
+        ws.cell(header_row, c).value = title
+        return c
+
+    # garante todos
+    cols["Segmento"] = cols["Segmento"] or _ensure_header("Segmento")
+    cols["Executiva"] = cols["Executiva"] or _ensure_header("Executiva")
+    cols["Endereço origem"] = cols.get("Endereço origem") or _ensure_header("Endereço origem")
+    cols["Cliente"] = cols["Cliente"] or _ensure_header("Cliente")
+    cols["Endereço"] = cols.get("Endereço") or _ensure_header("Endereço")
+    cols["Responsável"] = cols["Responsável"] or _ensure_header("Responsável")
+    cols["Contato"] = cols["Contato"] or _ensure_header("Contato")
+    cols["Atualizado em"] = cols["Atualizado em"] or _ensure_header("Atualizado em")
+
+    return header_row, cols
+
+
+def _last_filled_row_any(ws, header_row: int, cols_to_check):
+    """
+    Última linha com qualquer valor em qualquer uma das colunas informadas.
+    Isso evita 'start_row' errar quando a planilha tem várias linhas com Segmento/Executiva já preenchidos.
+    """
+    cols_to_check = [c for c in (cols_to_check or []) if isinstance(c, int) and c > 0]
+    if not cols_to_check:
+        return header_row
+
+    max_r = ws.max_row or header_row
+    for r in range(max_r, header_row, -1):
+        for c in cols_to_check:
+            v = ws.cell(r, c).value
+            if v is not None and str(v).strip() != "":
+                return r
+    return header_row
+
+
+def _digits_only(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
+
+
+
+def _clean_text(x) -> str:
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if s.lower() == "nan":
+        return ""
+    return s
+
+
+def _split_multi(value: str):
+    s = _clean_text(value)
+    if not s:
+        return []
+    # Split by common separators
+    parts = re.split(r"[;|,/]+|\s/\s", s)
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def _normalize_phone_br(raw: str) -> str:
+    s = _clean_text(raw)
+    if not s:
+        return ""
+    # Keep digits and plus
+    digits = re.sub(r"\D", "", s)
+    if not digits:
+        return ""
+    # If already has country code 55
+    if digits.startswith("55") and len(digits) >= 12:
+        return "+" + digits
+    # If BR local with DDD (10/11 digits)
+    if len(digits) in (10, 11):
+        return "+55" + digits
+    # fallback
+    return "+" + digits if not s.startswith("+") else s
+
+
+def _get_primary_phone_ddd(row) -> str:
+    """
+    Retorna SOMENTE o telefone no formato DDD+NÚMERO (apenas dígitos).
+    - Se vier com +55, remove o 55.
+    - Se vier com DDD (10/11 dígitos), mantém.
+    - Se vier 0800/sem DDD, retorna os dígitos como estão.
+    """
+    raw_tel = _clean_text(row.get("Telefone") if hasattr(row, "get") else "")
+    if not raw_tel:
+        return ""
+
+    for p in _split_multi(raw_tel):
+        digits = re.sub(r"\D", "", str(p))
+        if not digits:
+            continue
+
+        # remove país 55 quando estiver presente
+        if digits.startswith("55") and len(digits) in (12, 13, 14):
+            digits = digits[2:]
+
+        # se tiver 10/11 dígitos, é DDD+numero
+        if len(digits) in (10, 11):
+            return digits
+
+        # 0800 ou outros formatos sem DDD
+        if digits.startswith("0800") and len(digits) >= 10:
+            return digits
+
+        return digits
+
+    return ""
+
+
+def _get_email_or_site(row) -> str:
+    """
+    Preferência:
+    1) e-mail (se existir)
+    2) site (se não tiver e-mail)
+    """
+    email = _get_email_row(row)
+    if email:
+        return email
+
+    site = _clean_text(row.get("Website") if hasattr(row, "get") else "")
+    if not site or site == "-":
+        for k in ["Site", "URL", "Url", "url", "Website"]:
+            site = _clean_text(row.get(k) if hasattr(row, "get") else "")
+            if site and site != "-":
+                break
+    return site if site and site != "-" else ""
+
+
+def _extract_cep(text: str) -> str:
+    s = _clean_text(text)
+    if not s:
+        return ""
+    m = re.search(r"\b\d{5}-\d{3}\b", s)
+    if m:
+        return m.group(0)
+    m = re.search(r"\b\d{8}\b", s)
+    if m:
+        raw = m.group(0)
+        return f"{raw[:5]}-{raw[5:]}"
+    return ""
+
+
+def _clean_endereco_full(s: str) -> str:
+    """
+    Mantém o endereço COMPLETO (incluindo complementos),
+    apenas removendo ruídos comuns do final como ", Brasil".
+    """
+    s = _clean_text(s)
+    if not s:
+        return ""
+    s = re.sub(r",\s*Brasil\s*$", "", s, flags=re.IGNORECASE).strip()
+    return s
+
+
+
+def _split_endereco_brasil(full: str):
+    """
+    Heurística para Google formatted_address / strings de endereço no Brasil.
+    Retorna: (endereco_rua_num, bairro, cidade, cep)
+
+    Casos comuns do Google:
+      "R. Teixeira de Melo, 31 - Ipanema, Rio de Janeiro - RJ, 22410-001, Brasil"
+      "Av. Brasil, 5000 - Bonsucesso, Rio de Janeiro - RJ, 21040-360, Brasil"
+    """
+    s = _clean_text(full)
+    if not s or s.lower().startswith("endereço não"):
+        return (s, "", "", "")
+
+    cep = _extract_cep(s)
+
+    parts = [p.strip() for p in s.split(",") if p and p.strip()]
+    parts = [p for p in parts if p.lower() not in ("brasil",)]
+
+    endereco = ""
+    bairro = ""
+    cidade = ""
+
+    if not parts:
+        return (s, "", "", cep)
+
+    # 1) Endereço base (rua/av)
+    first = parts[0].strip()
+    # Caso: "Rua X, 123 - Bairro" vem inteiro no first
+    if " - " in first:
+        left, right = first.split(" - ", 1)
+        endereco = left.strip()
+        # se o lado esquerdo já tem número, ótimo; se não, vamos tentar adicionar depois
+        if right and not re.search(r"\s-\s*[A-Z]{2}\b", right):
+            bairro = right.strip()
+    else:
+        endereco = first
+
+    # 2) Detecta cidade (preferência: "Cidade - UF")
+    city_idx = None
+    for i, p in enumerate(parts):
+        if re.search(r"\s-\s*[A-Z]{2}\b", p):
+            cidade = re.sub(r"\s-\s*[A-Z]{2}\b.*$", "", p).strip()
+            city_idx = i
+            break
+
+    # 3) Se ainda não achou cidade: pega o último item "útil" (antes do CEP)
+    if not cidade:
+        for p in reversed(parts):
+            if cep and cep in p:
+                continue
+            if re.fullmatch(r"\d{5}-\d{3}", p) or re.fullmatch(r"\d{8}", p):
+                continue
+            if p.lower() == "brasil":
+                continue
+            cidade = p.strip()
+            city_idx = parts.index(p)
+            break
+
+    # 4) Número + Bairro costumam vir no 2º item: "31 - Ipanema" ou "31" ou "31 - Bairro"
+    def _apply_num_bairro(segment: str):
+        nonlocal endereco, bairro
+        seg = segment.strip()
+        mnb = re.match(r"^(\d+)\s*-\s*(.+)$", seg)
+        if mnb:
+            num = mnb.group(1).strip()
+            rest = mnb.group(2).strip()
+            # quando vier "num - complemento - bairro", pega o ÚLTIMO como bairro
+            b = rest.split(" - ")[-1].strip() if " - " in rest else rest
+            if num and num not in endereco:
+                endereco = f"{endereco}, {num}".strip().strip(",")
+            if not bairro and b:
+                bairro = b
+            return True
+        if re.fullmatch(r"\d+", seg):
+            num = seg
+            if num and num not in endereco:
+                endereco = f"{endereco}, {num}".strip().strip(",")
+            return True
+        return False
+
+    if len(parts) >= 2:
+        # se parts[1] é número/bairro, aplica
+        _apply_num_bairro(parts[1])
+
+    # 5) Se ainda não tiver bairro, tenta pegar o item imediatamente antes da cidade
+    if not bairro and city_idx is not None and city_idx - 1 >= 1:
+        cand = parts[city_idx - 1].strip()
+        # pode ser "31 - Ipanema" ou só "Ipanema"
+        if not _apply_num_bairro(cand):
+            if cand and not re.search(r"\s-\s*[A-Z]{2}\b", cand) and (not cep or cep not in cand):
+                # evita pegar o próprio endereço
+                if cand != endereco:
+                    bairro = cand
+
+    # 6) Caso ainda esteja vazio e exista parts[2], use como bairro (quando não for cidade)
+    if not bairro and len(parts) >= 3:
+        cand = parts[2].strip()
+        if cand and not re.search(r"\s-\s*[A-Z]{2}\b", cand) and (not cep or cep not in cand):
+            # evita repetir cidade
+            if cand != cidade:
+                bairro = cand
+
+    # 7) Limpeza final
+    if cep:
+        cidade = cidade.replace(cep, "").strip(" ,")
+        bairro = bairro.replace(cep, "").strip(" ,")
+
+    return (endereco, bairro, cidade, cep)
+
+
+
+def _get_endereco_fields(row):
+    """
+    Retorna (endereco_completo, bairro, cidade, cep).
+
+    - Endereço: SEMPRE completo (complementos) quando existir na fonte (Google formatted_address).
+    - Bairro: somente o bairro.
+    """
+    end_full_raw = _clean_text(row.get("Endereço") if hasattr(row, "get") else "")
+    endereco_full = _clean_endereco_full(end_full_raw)
+
+    # Se o OSM tiver só rua/num, ainda assim usamos isso como "Endereço"
+    if not endereco_full:
+        endereco_full = _clean_text(row.get("Endereco") if hasattr(row, "get") else "")
+
+    bairro = _clean_text(row.get("Bairro") if hasattr(row, "get") else "")
+    cidade = _clean_text(row.get("Cidade") if hasattr(row, "get") else "")
+    cep = _clean_text(row.get("CEP") if hasattr(row, "get") else "") or _clean_text(row.get("Cep") if hasattr(row, "get") else "")
+
+    # Se não veio estruturado, tenta inferir bairro/cidade/cep do endereço completo
+    if endereco_full and not (bairro or cidade or cep):
+        _e, b, c, z = _split_endereco_brasil(endereco_full)
+        bairro = bairro or b
+        cidade = cidade or c
+        cep = cep or z
+
+    # CEP fallback
+    if not cep and endereco_full:
+        cep = _extract_cep(endereco_full)
+
+    return endereco_full, bairro, cidade, cep
+
+
+
+
+
+def _extract_email_from_text(s: str) -> str:
+    s = _clean_text(s)
+    if not s:
+        return ""
+    m = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", s)
+    return m.group(1) if m else ""
+
+
+def _get_email_row(row) -> str:
+    # Prefer explicit email fields (OSM may provide)
+    for key in ["E-mail", "Email", "email", "contact:email"]:
+        v = row.get(key) if hasattr(row, "get") else None
+        e = _extract_email_from_text(v)
+        if e:
+            return e
+    # Sometimes comes embedded in website or notes
+    for key in ["Website", "Site", "URL", "Url", "url", "Maps"]:
+        v = row.get(key) if hasattr(row, "get") else None
+        e = _extract_email_from_text(v)
+        if e:
+            return e
+    return ""
+
+
+def _build_contato(row, email: str = "") -> str:
+    """
+    Contato robusto e seguro para Google Sheets (sem virar fórmula):
+    Prioridade: E-mail + Telefone.
+    - Nunca começa com "+" (pra não virar fórmula quando value_input_option=USER_ENTERED).
+    - Usa separador "; " (evita " | ").
+    """
+    # 1) e-mail (se já foi calculado, aproveita)
+    email_final = _clean_text(email) or _get_email_row(row)
+
+    # 2) telefones (normalizados)
+    phones = []
+    raw_tel = _clean_text(row.get("Telefone") if hasattr(row, "get") else "")
+    for p in _split_multi(raw_tel):
+        ph = _normalize_phone_br(p)
+        if ph and ph not in phones:
+            phones.append(ph)
+
+    # 3) outros canais (quando existirem)
+    whatsapp = _clean_text(row.get("WhatsApp") if hasattr(row, "get") else "")
+    instagram = _clean_text(row.get("Instagram") if hasattr(row, "get") else "")
+    facebook = _clean_text(row.get("Facebook") if hasattr(row, "get") else "")
+    linkedin = _clean_text(row.get("LinkedIn") if hasattr(row, "get") else "")
+    site = _clean_text(row.get("Website") if hasattr(row, "get") else "")
+    maps_url = _clean_text(row.get("Maps") if hasattr(row, "get") else "")
+
+    parts = []
+
+    # Prioridade: email e telefone
+    if email_final:
+        parts.append(f"Email: {email_final}")
+    if phones:
+        parts.append(f"Tel: {' / '.join(phones)}")
+
+    # Se ainda não tiver email/telefone, tenta site e maps como fallback
+    if not parts:
+        if site and site != "-":
+            parts.append(f"Site: {site}")
+        elif maps_url:
+            parts.append(f"Maps: {maps_url}")
+
+    # Complementos úteis (sem atrapalhar)
+    if whatsapp:
+        parts.append(f"WhatsApp: {whatsapp}")
+    if instagram:
+        parts.append(f"Instagram: {instagram}")
+    if facebook:
+        parts.append(f"Facebook: {facebook}")
+    if linkedin:
+        parts.append(f"LinkedIn: {linkedin}")
+
+    # Importante: separador seguro
+    return "; ".join([p for p in parts if p]).strip()
+
+
+
+def _get_responsavel_row(row) -> str:
+    # Sem scraping: pega somente se vier explícito (OSM contact:name/person)
+    for key in ["Responsável", "Responsavel", "contact:name", "contact:person"]:
+        v = _clean_text(row.get(key) if hasattr(row, "get") else "")
+        if v:
+            return v
+    return ""
+
+
+def _dedup_key(cliente: str, contato: str, email: str, endereco: str):
+    c = _clean_text(cliente).lower()
+    e = _clean_text(email).lower()
+    a = _clean_text(endereco).lower()
+    # phone digits priority
+    digits = re.sub(r"\D", "", _clean_text(contato))
+    if digits:
+        return (c, f"tel:{digits}")
+    if e:
+        return (c, f"email:{e}")
+    if a:
+        return (c, f"addr:{a}")
+    return (c, "")
+
+
+def _pick_row_value(row, candidates):
+    for c in candidates:
+        if c in row and row.get(c) is not None and str(row.get(c)).strip().lower() != "nan":
+            return row.get(c)
+    return ""
+
+
+def export_results_incremental_xlsx(
+    df,
+    template_bytes: bytes,
+    sheet_name: str,
+    executiva: str = "Vanessa",
+    updated_dt: datetime = None,
+    dedup: bool = True,
+):
+    """
+    Exporta incrementalmente para Excel na ordem exata:
+    Segmento | Cliente | Responsável | Contato | E-mail | Endereço | Atualizado em | Executiva
+    """
+    wb = load_workbook(BytesIO(template_bytes))
+    if sheet_name not in wb.sheetnames:
+        sheet_name = wb.sheetnames[0]
+    ws = wb[sheet_name]
+
+    header_row, col_map = _find_header_row(ws, scan_rows=40, scan_cols=80)
+
+    # Migração de template antigo (com Bairro/Cidade) para o novo layout:
+    # Segmento | Cliente | Responsável | Contato | Já fiz contato? | Data de contato | E-mail | Endereço | Bairro | CEP | Atualizado em | Executiva
+    try:
+        old_headers = ["Segmento", "Cliente", "Responsável", "Contato", "E-mail", "Endereço", "Bairro", "Cidade", "CEP", "Atualizado em", "Executiva"]
+        expected_headers = _EXPORT_REQUIRED_HEADERS
+
+        if header_row is not None:
+            cur = [ws.cell(header_row, c).value for c in range(1, 12)]
+            cur_norm = [_norm_header(x) for x in cur]
+            old_norm = [_norm_header(x) for x in old_headers]
+
+            cur_trim = [x for x in cur_norm if x]
+            if cur_trim == old_norm:
+                ws.insert_cols(5, 2)   # após Contato
+                ws.delete_cols(10, 1)  # remove Cidade (mantém Bairro)
+                for i, h in enumerate(expected_headers, start=1):
+                    ws.cell(header_row, i).value = h
+                col_map = {}
+                for c in range(1, 61):
+                    v = _norm_header(ws.cell(header_row, c).value)
+                    if v:
+                        col_map.setdefault(v, []).append(c)
+    except Exception:
+        pass
+
+    if header_row is None:
+        header_row = 1
+        for i, h in enumerate(_EXPORT_REQUIRED_HEADERS, start=1):
+            ws.cell(header_row, i).value = h
+        col_map = {_norm_header(h): [i] for i, h in enumerate(_EXPORT_REQUIRED_HEADERS, start=1)}
+    else:
+        all_cols = col_map
+
+        def pick(h):
+            cols = all_cols.get(_norm_header(h)) or []
+            return cols[0] if cols else None
+
+        def first_empty_col(max_col=30):
+            for c in range(1, max_col + 1):
+                v = ws.cell(header_row, c).value
+                if v is None or str(v).strip() == "":
+                    return c
+            return (ws.max_column or max_col) + 1
+
+        for h in _EXPORT_REQUIRED_HEADERS:
+            if pick(h) is None:
+                c = first_empty_col()
+                ws.cell(header_row, c).value = h
+                all_cols.setdefault(_norm_header(h), []).append(c)
+        col_map = all_cols
+
+    def col(h):
+        cols = col_map.get(_norm_header(h)) or []
+        return cols[0] if cols else None
+
+    cols = {h: col(h) for h in _EXPORT_REQUIRED_HEADERS}
+
+    if updated_dt is None:
+        if ZoneInfo is not None:
+            updated_dt = datetime.now(ZoneInfo("America/Sao_Paulo"))
+        else:
+            updated_dt = datetime.now()
+    updated_str = updated_dt.strftime("%d/%m/%Y %H:%M:%S")
+
+    last_existing = _last_filled_row_any(ws, header_row, [cols["Cliente"]])
+
+    existing = set()
+    if dedup:
+        for r in range(header_row + 1, last_existing + 1):
+            c = ws.cell(r, cols["Cliente"]).value
+            t = ws.cell(r, cols["Contato"]).value
+            key = _dedup_key(str(c or ""), str(t or ""), str(ws.cell(r, cols["E-mail"]).value if cols.get("E-mail") else ""), str(ws.cell(r, cols["Endereço"]).value if cols.get("Endereço") else ""))
+            if key != ("", ""):
+                existing.add(key)
+
+    start_row = max(header_row + 1, last_existing + 1)
+
+    def extract_email(*vals) -> str:
+        for v in vals:
+            if v is None:
+                continue
+            s = str(v).strip()
+            mm = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", s)
+            if mm:
+                return mm.group(1)
+        return ""
+
+    added = 0
+    skipped = 0
+
+    for _, row in df.iterrows():
+        segmento = str(_pick_row_value(row, ["Categoria", "Segmento"])).strip()
+        cliente = str(_pick_row_value(row, ["Nome", "Cliente", "Estabelecimento", "Nome do estabelecimento"])).strip()
+
+        # Contato robusto (telefones + sociais + site) e e-mail quando existir
+        email = _get_email_or_site(row)
+        contato = _get_primary_phone_ddd(row)
+        endereco, bairro, _cidade, cep = _get_endereco_fields(row)
+        responsavel = _get_responsavel_row(row)
+
+        if contato == "-" or contato.lower() == "nan":
+            contato = ""
+        if cliente.lower() == "nan":
+            cliente = ""
+
+        key = _dedup_key(cliente, contato, email, endereco)
+        if dedup and key in existing and key != ("", ""):
+            skipped += 1
+            continue
+
+        rr = start_row + added
+        ws.cell(rr, cols["Segmento"]).value = segmento
+        ws.cell(rr, cols["Cliente"]).value = cliente
+        ws.cell(rr, cols["Responsável"]).value = responsavel
+        ws.cell(rr, cols["Contato"]).value = contato
+        ws.cell(rr, cols["Já fiz contato?"]).value = ""
+        ws.cell(rr, cols["Data de contato"]).value = ""
+        ws.cell(rr, cols["E-mail"]).value = email
+        ws.cell(rr, cols["Endereço"]).value = endereco
+        ws.cell(rr, cols["CEP"]).value = cep
+        ws.cell(rr, cols["Atualizado em"]).value = updated_str
+        ws.cell(rr, cols["Executiva"]).value = executiva
+
+        added += 1
+        if dedup and key != ("", ""):
+            existing.add(key)
+
+    # Ordenar por Segmento (Apenas colunas do schema) - deixa a planilha organizada
+    try:
+        if added > 0:
+            seg_col = cols.get("Segmento")
+            if seg_col:
+                last_row = _last_filled_row_any(ws, header_row, [cols.get("Cliente"), cols.get("Contato"), seg_col])
+                data_rows = []
+                for r in range(header_row + 1, last_row + 1):
+                    row_vals = [ws.cell(r, cols[h]).value if cols.get(h) else None for h in _EXPORT_REQUIRED_HEADERS]
+                    data_rows.append(row_vals)
+                data_rows.sort(key=lambda rv: str(rv[0] or "").strip().lower())  # Segmento é o 1º campo
+                for i, rv in enumerate(data_rows, start=header_row + 1):
+                    for j, h in enumerate(_EXPORT_REQUIRED_HEADERS):
+                        c = cols.get(h)
+                        if c:
+                            ws.cell(i, c).value = rv[j]
+    except Exception:
+        pass
+    # Formatação: Data de contato (dd/mm/aaaa) e validação simples para "Já fiz contato?"
+    try:
+        date_col = cols.get("Data de contato")
+        chk_col = cols.get("Já fiz contato?")
+        if date_col:
+            for r in range(header_row + 1, (ws.max_row or header_row) + 1):
+                ws.cell(r, date_col).number_format = "dd/mm/yyyy"
+        if chk_col:
+            from openpyxl.worksheet.datavalidation import DataValidation
+            from openpyxl.utils import get_column_letter
+            dv = DataValidation(type="list", formula1='"TRUE,FALSE"', allow_blank=True)
+            ws.add_data_validation(dv)
+            dv.add(f"{get_column_letter(chk_col)}{header_row+1}:{get_column_letter(chk_col)}{ws.max_row or header_row+1}")
+    except Exception:
+        pass
+
+
+
+
+
+    out = BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.getvalue(), {"added": added, "skipped": skipped, "sheet": sheet_name}
+
+def _parse_gsheet_id(url_or_id: str) -> str:
+    s = (url_or_id or "").strip()
+    if not s:
+        return ""
+    if re.fullmatch(r"[a-zA-Z0-9-_]{20,}", s):
+        return s
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", s)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _extract_sheet_id(url_or_id: str) -> str:
+    """
+    Aceita URL completa do Google Sheets ou ID puro e retorna somente o spreadsheet_id.
+    Alias para compatibilidade com versões anteriores.
+    """
+    s = str(url_or_id or "").strip()
+    if not s:
+        return ""
+    try:
+        return _parse_gsheet_id(s)
+    except Exception:
+        pass
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", s)
+    if m:
+        return m.group(1)
+    return s
+
+
+def _get_gspread_client(sa_info_override: dict | None = None, cred_path_override: str | None = None):
+    """
+    Streamlit Cloud:
+      - coloque o JSON do Service Account em st.secrets, ex:
+        [gcp_service_account]
+        type="service_account"
+        project_id="..."
+        private_key="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+        client_email="..."
+        ...
+    Alternativas:
+      - env var GOOGLE_SERVICE_ACCOUNT_JSON (json string)
+      - env var GOOGLE_APPLICATION_CREDENTIALS (caminho do json)
+    """
+    if gspread is None or Credentials is None:
+        raise RuntimeError("Dependências não instaladas. Instale: gspread e google-auth (ou adicione no requirements.txt).")
+
+    # Override (uso local): JSON enviado via UI ou caminho digitado pelo usuário
+    if sa_info_override:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(sa_info_override, scopes=scopes)
+        return gspread.authorize(creds)
+
+
+    sa_info = None
+    try:
+        if _safe_secrets_has("gcp_service_account"):
+            sa_info = dict(_safe_secrets_get("gcp_service_account"))
+        elif _safe_secrets_has("google_service_account"):
+            sa_info = dict(_safe_secrets_get("google_service_account") or {})
+        elif _safe_secrets_has("service_account"):
+            sa_info = dict(_safe_secrets_get("service_account") or {})
+    except Exception:
+        sa_info = None
+
+    if sa_info:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        return gspread.authorize(creds)
+
+    env_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if env_json:
+        import json as _json
+        sa_info = _json.loads(env_json)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        return gspread.authorize(creds)
+
+    cred_path = (cred_path_override or os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "") or "").strip()
+    if cred_path and os.path.exists(cred_path):
+        return gspread.service_account(filename=cred_path)
+
+    # Uso local: se existir um JSON na mesma pasta do app, usa automaticamente
+    try:
+        local_fp = os.path.join(_app_base_dir(), "service_account.json")
+        if os.path.exists(local_fp):
+            return gspread.service_account(filename=local_fp)
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Credenciais do Google não configuradas. "
+        "Opções: (1) Cloud: colocar o Service Account JSON em st.secrets (gcp_service_account); "
+        "(2) Local: enviar o JSON na tela do app; "
+        "(3) Local: definir GOOGLE_APPLICATION_CREDENTIALS apontando para o .json; "
+        "(4) Local: colocar service_account.json na mesma pasta do app."
+    )
+
+
+def _gs_norm(v) -> str:
+    return ("" if v is None else str(v)).strip().lower()
+
+
+def _digits_only(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
+
+
+
+def _gs_sort_by_segmento(ws, data_rows_count: int):
+    """
+    Ordena a aba por Segmento (coluna A) mantendo o header na linha 1.
+    """
+    try:
+        if not data_rows_count or int(data_rows_count) <= 1:
+            return
+        ws.spreadsheet.batch_update(
+            {
+                "requests": [
+                    {
+                        "sortRange": {
+                            "range": {
+                                "sheetId": ws.id,
+                                "startRowIndex": 1,  # pula header
+                                "endRowIndex": 1 + int(data_rows_count),
+                                "startColumnIndex": 0,
+                                "endColumnIndex": 13,  # A..M
+                            },
+                            "sortSpecs": [{"dimensionIndex": 0, "sortOrder": "ASCENDING"}],
+                        }
+                    }
+                ]
+            }
+        )
+    except Exception:
+        # Não bloqueia exportação se falhar
+        return
+
+
+
+def _gs_apply_contact_columns(ws, max_rows: int = 5000):
+    """
+    Aplica:
+    - Checkbox na coluna "Já fiz contato?"
+    - Formato de data dd/MM/yyyy na coluna "Data de contato"
+    """
+    try:
+        header = ws.row_values(1) or []
+        header_norm = [_gs_norm(x) for x in header]
+
+        def idx_of(name: str, default_1based: int):
+            n = _gs_norm(name)
+            if n in header_norm:
+                return header_norm.index(n) + 1
+            return default_1based
+
+        col_checkbox = idx_of("Já fiz contato?", 6)  # F
+        col_date = idx_of("Data de contato", 7)      # G
+
+        end_row = int(max_rows)
+
+        cb_start_col = col_checkbox - 1
+        cb_end_col = col_checkbox
+        dt_start_col = col_date - 1
+        dt_end_col = col_date
+
+        ws.spreadsheet.batch_update({
+            "requests": [
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": ws.id,
+                            "startRowIndex": 1,
+                            "endRowIndex": end_row,
+                            "startColumnIndex": cb_start_col,
+                            "endColumnIndex": cb_end_col
+                        },
+                        "rule": {
+                            "condition": {"type": "BOOLEAN"},
+                            "showCustomUi": True,
+                            "strict": True
+                        }
+                    }
+                },
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": ws.id,
+                            "startRowIndex": 1,
+                            "endRowIndex": end_row,
+                            "startColumnIndex": dt_start_col,
+                            "endColumnIndex": dt_end_col
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "numberFormat": {"type": "DATE", "pattern": "dd/MM/yyyy"}
+                            }
+                        },
+                        "fields": "userEnteredFormat.numberFormat"
+                    }
+                }
+            ]
+        })
+    except Exception:
+        return
+
+def _ensure_gsheet_headers(ws):
+    """
+    Headers alvo (A1:M1) — BASE ZERADA:
+    Segmento | Executiva Pixel | Empresa (Cliente) | Responsável Empresa | Telefone |
+    Já fiz contato? | Data de contato | Observações | E-mail | Endereço | Bairro | CEP | Atualizado em
+    """
+    expected = _GS_EXPORT_HEADERS
+    expected_norm = [_gs_norm(x) for x in expected]
+
+    # lê A1:M1
+    cur = [ws.cell(1, c).value for c in range(1, 14)]
+    cur_norm = [_gs_norm(x) for x in cur]
+
+    # se diferente, padroniza
+    if cur_norm != expected_norm:
+        ws.update("A1:M1", [expected])
+
+
+def _gs_apply_row_rules(ws, max_rows: int = 5000):
+    """
+    Regras de formatação condicional (linha inteira A..M):
+    - Verde claro quando "Já fiz contato?" for TRUE
+    - Vermelho quando "Executiva Pixel" tiver valor diferente de "Vanessa" (e não vazio)
+    """
+    try:
+        # Remove regras existentes dessa aba (base zerada → podemos limpar com segurança)
+        meta = ws.spreadsheet.fetch_sheet_metadata()
+        sheet = None
+        for s in (meta.get("sheets") or []):
+            props = (s.get("properties") or {})
+            if props.get("sheetId") == ws.id:
+                sheet = s
+                break
+
+        existing_rules = (sheet or {}).get("conditionalFormats") or []
+        if existing_rules:
+            # deletar do fim pro começo
+            reqs = []
+            for idx in range(len(existing_rules) - 1, -1, -1):
+                reqs.append({
+                    "deleteConditionalFormatRule": {
+                        "sheetId": ws.id,
+                        "index": idx
+                    }
+                })
+            ws.spreadsheet.batch_update({"requests": reqs})
+
+        # Range: linhas 2..max_rows, colunas A..M
+        rng = {
+            "sheetId": ws.id,
+            "startRowIndex": 1,
+            "endRowIndex": int(max_rows),
+            "startColumnIndex": 0,
+            "endColumnIndex": 13
+        }
+
+        # 1) Verde claro (prioridade maior)
+        green_rule = {
+            "addConditionalFormatRule": {
+                "index": 0,
+                "rule": {
+                    "ranges": [rng],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "CUSTOM_FORMULA",
+                            "values": [{"userEnteredValue": "=$F2=TRUE"}]
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 0.85, "green": 0.95, "blue": 0.85}
+                        }
+                    }
+                }
+            }
+        }
+
+        # 2) Vermelho (Executiva Pixel != Vanessa e != vazio)
+        red_rule = {
+            "addConditionalFormatRule": {
+                "index": 1,
+                "rule": {
+                    "ranges": [rng],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "CUSTOM_FORMULA",
+                            "values": [{"userEnteredValue": "=AND($B2<>\"\",$B2<>\"Vanessa\")"}]
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 0.98, "green": 0.82, "blue": 0.82}
+                        }
+                    }
+                }
+            }
+        }
+
+        ws.spreadsheet.batch_update({"requests": [green_rule, red_rule]})
+    except Exception:
+        return
+
+
+def export_results_incremental_gsheet(
+    df,
+    spreadsheet_url_or_id: str,
+    worksheet_name: str = DEFAULT_GSHEET_TAB,
+    executiva: str = "Vanessa",
+    updated_dt: datetime = None,
+    dedup: bool = True,
+    sa_info_override: dict | None = None,
+    cred_path_override: str | None = None,
+):
+    """
+    Exporta incrementalmente para Google Sheets na ordem exata:
+    Segmento | Cliente | Responsável | Contato | Já fiz contato? | Data de contato | E-mail | Endereço | Bairro | CEP | Atualizado em | Executiva
+    """
+    gc = _get_gspread_client(sa_info_override=sa_info_override, cred_path_override=cred_path_override)
+
+    spreadsheet_id = _extract_sheet_id(spreadsheet_url_or_id or DEFAULT_GSHEET_ID)
+    if not spreadsheet_id:
+        raise RuntimeError("ID da planilha não informado (GSHEET_ID/DEFAULT_GSHEET_ID).")
+
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(worksheet_name)
+
+    _ensure_gsheet_headers(ws)
+    _gs_apply_contact_columns(ws)
+    _gs_apply_row_rules(ws)
+
+    if updated_dt is None:
+        if ZoneInfo is not None:
+            updated_dt = datetime.now(ZoneInfo("America/Sao_Paulo"))
+        else:
+            updated_dt = datetime.now()
+    updated_str = updated_dt.strftime("%d/%m/%Y %H:%M:%S")
+
+    # lê A2:L (dados)
+    existing_rows = ws.get("A2:M") or []
+
+    existing = set()
+    if dedup:
+        for r in existing_rows:
+            cliente0 = (r[2] if len(r) > 2 else "").strip()
+            contato0 = (r[4] if len(r) > 4 else "").strip()
+            email0 = (r[8] if len(r) > 8 else "").strip()
+            endereco0 = (r[9] if len(r) > 9 else "").strip() > 7 else "").strip()
+            key = _dedup_key(cliente0, contato0, email0, endereco0)
+            if key != ("", ""):
+                existing.add(key)
+
+    rows_to_append = []
+    skipped = 0
+
+    for _, row in df.iterrows():
+        segmento = str(_pick_row_value(row, ["Categoria", "Segmento"])).strip()
+        cliente = str(_pick_row_value(row, ["Nome", "Cliente", "Estabelecimento", "Nome do estabelecimento"])).strip()
+
+        # contato e email
+        contato = _get_primary_phone_ddd(row)
+        email = _get_email_or_site(row)
+
+        endereco, bairro, _cidade, cep = _get_endereco_fields(row)
+
+        responsavel = _get_responsavel_row(row)
+
+        key = _dedup_key(cliente, contato, email, endereco)
+        if dedup and key in existing and key != ("", ""):
+            skipped += 1
+            continue
+
+        rows_to_append.append([segmento, executiva, cliente, responsavel, contato, False, "", "", email, endereco, bairro, cep, updated_str])
+        if dedup and key != ("", ""):
+            existing.add(key)
+
+    if rows_to_append:
+        ws.append_rows(rows_to_append, value_input_option="RAW")
+        # ordena por Segmento (mantém header)
+        _gs_sort_by_segmento(ws, data_rows_count=(len(existing_rows) + len(rows_to_append)))
+
+    return {"added": len(rows_to_append), "skipped": skipped, "spreadsheet_id": spreadsheet_id, "worksheet": worksheet_name}
+
+def nominatim_suggest(query: str, limit: int = 6) -> list[dict]:
+    """
+    Busca sugestões no Nominatim (OSM).
+    Retorna uma lista de dicts com display_name + address details.
+    """
+    q = (query or "").strip()
+    if len(q) < 4:
+        return []
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "format": "jsonv2",
+        "q": q,
+        "addressdetails": 1,
+        "limit": int(limit),
+        "countrycodes": "br",
+    }
+    headers = {"User-Agent": "SuplemexApp/1.0 (streamlit)"}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            return []
+        return data
+    except Exception:
+        return []
+
+def _uf_allowed_for_result(res: dict) -> bool:
+    if not ALLOWED_UF:
         return True
     try:
         addr = res.get("address") or {}
@@ -147,13 +1355,9 @@ ALLOWED_UF:
     except Exception:
         return False
 
-def get_suggestions_filtered(query: str, limit: int = 6, api_key: str = "") -> list[str]:
+def get_suggestions_filtered(query: str, limit: int = 6) -> list[str]:
+    raw = nominatim_suggest(query, limit=limit)
     out: list[str] = []
-    # 1) tenta Google (se houver API key)
-    if (api_key or "").strip():
-        out = google_places_autocomplete_suggest(query, api_key=api_key, limit=limit)
-    # 2) fallback: Nominatim/OSM
-    raw = nominatim_suggest(query, limit=limit) if not out else []
     for r in raw:
         if not isinstance(r, dict):
             continue
@@ -1099,7 +2303,7 @@ def main():
         # Sugestões estilo Google (aparecem enquanto digita) — estável e bonito
         _q = (st.session_state.get("addr_input") or "").strip()
         st.session_state["addr_last_query"] = _q
-        _sugs = get_suggestions_filtered(_q, limit=6, api_key=api_key) if len(_q) >= 4 else []
+        _sugs = get_suggestions_filtered(_q, limit=6) if len(_q) >= 4 else []
         st.session_state["addr_suggestions"] = _sugs
 
         # CSS (visual “Google-like”)
@@ -1576,7 +2780,7 @@ def _run_streamlit_from_python():
     print(f"🔗 URL: http://127.0.0.1:{port}")
     print("=" * 60)
     # Bloqueia no processo do Streamlit (CTRL+C para parar)
-    subprocess.run(args)
+    # subprocess.run(args)
 
 
 if __name__ == "__main__":
