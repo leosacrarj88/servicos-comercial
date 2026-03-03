@@ -903,6 +903,7 @@ def export_results_incremental_xlsx(
 
     for _, row in df.iterrows():
         segmento = str(_pick_row_value(row, ["Categoria", "Segmento"])).strip()
+        seg = segmento  # compat: evita NameError caso algum trecho antigo use `seg`
         cliente = str(_pick_row_value(row, ["Nome", "Cliente", "Estabelecimento", "Nome do estabelecimento"])).strip()
 
         # Contato robusto (telefones + sociais + site) e e-mail quando existir
@@ -1679,7 +1680,7 @@ def main():
     # ===============================
     CATEGORIES_CONFIG = {
         "🛒 Mercados": {"google_type": "supermarket", "osm": ["shop=supermarket", "shop=convenience", "shop=grocery"]},
-        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual","municipal","ciep","CIEP"]},
+        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual"]},
         "🏫 Faculdades/Universidades": {"google_type": "school", "osm": ["amenity=university"]},
         # "🏗️ Construtoras": {"google_type": "general_contractor", "osm": ["office=construction", "craft=builder", "office=architect"]},
         "🏥 Hospitais": {"google_type": "hospital", "osm": ["amenity=hospital", "amenity=clinic", "amenity=doctors"]},
@@ -2995,7 +2996,7 @@ def _run_streamlit_from_python():
     print(f"🔗 URL: http://127.0.0.1:{port}")
     print("=" * 60)
     # Bloqueia no processo do Streamlit (CTRL+C para parar)
-    # subprocess.run(args)
+    subprocess.run(args)
 
 
 if __name__ == "__main__":
