@@ -546,7 +546,7 @@ def _split_endereco_brasil(full: str):
             break
 
     # 4) Número + Bairro costumam vir no 2º item: "31 - Ipanema" ou "31" ou "31 - Bairro"
-    def _apply_num_bairro(segment: str):
+def _apply_num_bairro(segment: str):
     nonlocal endereco, bairro
     seg = (segment or "").strip()
     if not seg:
