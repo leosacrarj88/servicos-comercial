@@ -486,20 +486,25 @@ def _clean_endereco_full(s: str) -> str:
     return s
 
 
-
 def _split_endereco_brasil(full: str):
-    """Extrai Endereço (rua + número quando possível), Bairro e CEP de um endereço BR.
+    """Extrai (endereco, bairro, cidade_uf, cep) de um endereço BR.
+
+    Retorno SEMPRE com 4 valores para uso em _get_endereco_fields():
+      - endereco: rua + número (quando possível)
+      - bairro: somente o bairro (ex.: "Leblon")
+      - cidade_uf: segmento "Cidade - UF" (ex.: "Rio de Janeiro - RJ") quando identificado, senão ""
+      - cep: "00000-000" quando identificado, senão ""
 
     Regras (cirúrgicas):
     - CEP: 00000-000 ou 00000000
     - Bairro: prioriza o último trecho após hífen/travessão em segmentos como:
         "64 302 - Leblon" -> "Leblon"
         "1.235 - sala 303 - Leblon" -> "Leblon"
-    - Cidade/UF: identifica o segmento que contém " - RJ" (ou outra UF) para localizar o bairro no item anterior.
+    - Cidade/UF: identifica o primeiro segmento que contém " - UF" para localizar o bairro no item anterior.
     """
     s = (full or "").strip()
     if not s:
-        return "", "", ""
+        return "", "", "", ""
 
     # Normaliza espaços e remove país no final
     s = re.sub(r"\s+", " ", s)
@@ -528,8 +533,7 @@ def _split_endereco_brasil(full: str):
             city_idx = i
             break
 
-    bairro = ""
-    numero = ""
+    cidade_uf = parts[city_idx] if city_idx is not None else ""
 
     def _extract_bairro_from_segment(seg: str) -> str:
         seg = (seg or "").strip()
@@ -549,9 +553,7 @@ def _split_endereco_brasil(full: str):
         mnum = re.match(r"^([\d\.]+(?:\s+[\d\.]+)*)", seg)
         if not mnum:
             return ""
-        num_raw = mnum.group(1).strip()
-        # mantém pontos/espacos, mas também cria versão limpa quando aplicável
-        return num_raw
+        return mnum.group(1).strip()
 
     # Candidato a segmento de bairro: normalmente o item anterior à cidade/UF
     cand_seg = ""
@@ -560,12 +562,12 @@ def _split_endereco_brasil(full: str):
     elif len(parts) >= 2:
         cand_seg = parts[1]
 
-    # Extrai bairro do candidato
     bairro = _extract_bairro_from_segment(cand_seg)
 
     # Se candidato tem número antes do hífen, captura
+    numero = ""
     if cand_seg:
-        left = cand_seg.split("-")[0] if "-" in cand_seg else cand_seg
+        left = re.split(r"[-–—]", cand_seg, maxsplit=1)[0].strip()
         numero = _extract_num_from_left(left)
 
     # Endereço base: primeiro item é a rua/avenida
@@ -573,17 +575,16 @@ def _split_endereco_brasil(full: str):
     endereco = endereco.strip(" ,-")
     if numero:
         # se já tem número no endereço, não duplica
-        if not re.search(r"\b\d+\b", endereco):
+        if not re.search(r"\b\d+[\d\.]*\b", endereco):
             endereco = f"{endereco}, {numero}"
 
-    # Limpeza final do bairro (remove complementos se ainda vierem grudados)
+    # Limpeza final do bairro
     if bairro:
         # Se ainda vier algo do tipo "sala 303 - Leblon", pega o último novamente
-        if " - " in bairro:
-            bairro = bairro.split(" - ")[-1].strip()
-        # Remove pontuação excessiva
+        if re.search(r"\s*[-–—]\s*", bairro):
+            bairro = re.split(r"\s*[-–—]\s*", bairro)[-1].strip()
         bairro = bairro.strip(" ,-")
-    return endereco, bairro, cep
+    return endereco, bairro, cidade_uf, cep
 
 def _get_endereco_fields(row):
     """
@@ -1618,7 +1619,7 @@ def main():
     # ===============================
     CATEGORIES_CONFIG = {
         "🛒 Mercados": {"google_type": "supermarket", "osm": ["shop=supermarket", "shop=convenience", "shop=grocery"]},
-        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual","municipal","ciep","CIEP"]},
+        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual"]},
         "🏫 Faculdades/Universidades": {"google_type": "school", "osm": ["amenity=university"]},
         # "🏗️ Construtoras": {"google_type": "general_contractor", "osm": ["office=construction", "craft=builder", "office=architect"]},
         "🏥 Hospitais": {"google_type": "hospital", "osm": ["amenity=hospital", "amenity=clinic", "amenity=doctors"]},
