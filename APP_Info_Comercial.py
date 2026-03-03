@@ -1736,7 +1736,7 @@ def main():
         must = [str(x).strip().lower() for x in (cfg.get("name_must_contain") or []) if str(x).strip()]
         must_extra = [str(x).strip().lower() for x in (cfg.get("name_must_contain_extra_any") or []) if str(x).strip()]
         excl = [str(x).strip().lower() for x in (cfg.get("name_exclude") or []) if str(x).strip()]
-        seg_terms = [str(x).strip().lower( for x in (cfg.get("segment_name_any") or []) if str(x).strip()]
+        seg_terms = [str(x).strip().lower() for x in (cfg.get("segment_name_any") or []) if str(x).strip()]
         conditional_requires = cfg.get("conditional_requires") or []
         if not must and not must_extra and not excl:
             return rows
