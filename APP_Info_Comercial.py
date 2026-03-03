@@ -488,163 +488,102 @@ def _clean_endereco_full(s: str) -> str:
 
 
 def _split_endereco_brasil(full: str):
+    """Extrai Endereço (rua + número quando possível), Bairro e CEP de um endereço BR.
+
+    Regras (cirúrgicas):
+    - CEP: 00000-000 ou 00000000
+    - Bairro: prioriza o último trecho após hífen/travessão em segmentos como:
+        "64 302 - Leblon" -> "Leblon"
+        "1.235 - sala 303 - Leblon" -> "Leblon"
+    - Cidade/UF: identifica o segmento que contém " - RJ" (ou outra UF) para localizar o bairro no item anterior.
     """
-    Heurística para Google formatted_address / strings de endereço no Brasil.
-    Retorna: (endereco_rua_num, bairro, cidade, cep)
+    s = (full or "").strip()
+    if not s:
+        return "", "", ""
 
-    Casos comuns do Google:
-      "R. Teixeira de Melo, 31 - Ipanema, Rio de Janeiro - RJ, 22410-001, Brasil"
-      "Av. Brasil, 5000 - Bonsucesso, Rio de Janeiro - RJ, 21040-360, Brasil"
-    """
-    s = _clean_text(full)
-    if not s or s.lower().startswith("endereço não"):
-        return (s, "", "", "")
+    # Normaliza espaços e remove país no final
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\s*,\s*Brasil\s*$", "", s, flags=re.IGNORECASE).strip()
 
-    cep = _extract_cep(s)
-
-    parts = [p.strip() for p in s.split(",") if p and p.strip()]
-    parts = [p for p in parts if p.lower() not in ("brasil",)]
-
-    endereco = ""
-    bairro = ""
-    cidade = ""
-
-    if not parts:
-        return (s, "", "", cep)
-
-    # 1) Endereço base (rua/av)
-    first = parts[0].strip()
-    # Caso: "Rua X, 123 - Bairro" vem inteiro no first
-    if " - " in first:
-        left, right = first.split(" - ", 1)
-        endereco = left.strip()
-        # se o lado esquerdo já tem número, ótimo; se não, vamos tentar adicionar depois
-        if right and not re.search(r"\s-\s*[A-Z]{2}\b", right):
-            bairro = right.strip()
+    # CEP
+    cep = ""
+    m = re.search(r"\b\d{5}-\d{3}\b", s)
+    if m:
+        cep = m.group(0)
+        s = (s[:m.start()] + s[m.end():]).strip(" ,-")
     else:
-        endereco = first
+        m2 = re.search(r"\b\d{8}\b", s)
+        if m2:
+            raw = m2.group(0)
+            cep = f"{raw[:5]}-{raw[5:]}"
+            s = (s[:m2.start()] + s[m2.end():]).strip(" ,-")
 
-    # 2) Detecta cidade (preferência: "Cidade - UF")
+    # Quebra por vírgulas (formato mais comum de geocoders)
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+
+    # Localiza cidade/UF (ex.: "Rio de Janeiro - RJ")
     city_idx = None
     for i, p in enumerate(parts):
         if re.search(r"\s-\s*[A-Z]{2}\b", p):
-            cidade = re.sub(r"\s-\s*[A-Z]{2}\b.*$", "", p).strip()
             city_idx = i
             break
 
-    # 3) Se ainda não achou cidade: pega o último item "útil" (antes do CEP)
-    if not cidade:
-        for p in reversed(parts):
-            if cep and cep in p:
-                continue
-            if re.fullmatch(r"\d{5}-\d{3}", p) or re.fullmatch(r"\d{8}", p):
-                continue
-            if p.lower() == "brasil":
-                continue
-            cidade = p.strip()
-            city_idx = parts.index(p)
-            break
-    # 4) Número + Bairro costumam vir no 2º item: "31 - Ipanema" ou "31" ou "31 - Bairro"
-    def _apply_num_bairro(segment: str) -> bool:
-        nonlocal endereco, bairro
-        seg_txt = (segment or "").strip()
-        if not seg_txt:
-            return False
+    bairro = ""
+    numero = ""
 
-        # aceita hífen normal e travessões
-        dash_parts = re.split(r"\s*[-–—]\s*", seg_txt)
+    def _extract_bairro_from_segment(seg: str) -> str:
+        seg = (seg or "").strip()
+        if not seg:
+            return ""
+        # separa por hífen/travessão; bairro é SEMPRE o último pedaço
+        dash_parts = [x.strip() for x in re.split(r"\s*[-–—]\s*", seg) if x.strip()]
         if len(dash_parts) >= 2:
-            left = " - ".join(dash_parts[:-1]).strip()
-            right = dash_parts[-1].strip()
+            return dash_parts[-1]
+        return ""
 
-            # número pode vir como "64", "1.235", ou "64 302" (complemento)
-            mnum = re.match(r"^([\d\.]+)", left)
-            num_raw = (mnum.group(1) if mnum else "").strip()
-            num = re.sub(r"\D", "", num_raw) or num_raw
+    def _extract_num_from_left(seg: str) -> str:
+        seg = (seg or "").strip()
+        if not seg:
+            return ""
+        # pega o início numérico, aceitando ponto e blocos ("64 302" ou "1.235")
+        mnum = re.match(r"^([\d\.]+(?:\s+[\d\.]+)*)", seg)
+        if not mnum:
+            return ""
+        num_raw = mnum.group(1).strip()
+        # mantém pontos/espacos, mas também cria versão limpa quando aplicável
+        return num_raw
 
-            # bairro: sempre o último pedaço após o hífen/travessão
-            b = right
-            # se vier "complemento - bairro", pega o ÚLTIMO como bairro
-            if b and (" - " in b):
-                b = b.split(" - ")[-1].strip()
+    # Candidato a segmento de bairro: normalmente o item anterior à cidade/UF
+    cand_seg = ""
+    if city_idx is not None and city_idx - 1 >= 0:
+        cand_seg = parts[city_idx - 1]
+    elif len(parts) >= 2:
+        cand_seg = parts[1]
 
-            if num and num not in endereco:
-                endereco = f"{endereco}, {num}".strip().strip(",")
-            if b:
-                bairro = b.strip()
-            return True
+    # Extrai bairro do candidato
+    bairro = _extract_bairro_from_segment(cand_seg)
 
-        # somente número (com ou sem ponto)
-        if re.fullmatch(r"[\d\.]+", seg_txt):
-            num = seg_txt_txt
-            if num and num not in endereco:
-                endereco = f"{endereco}, {num}".strip().strip(",")
-            return True
+    # Se candidato tem número antes do hífen, captura
+    if cand_seg:
+        left = cand_seg.split("-")[0] if "-" in cand_seg else cand_seg
+        numero = _extract_num_from_left(left)
 
-        return False
+    # Endereço base: primeiro item é a rua/avenida
+    endereco = parts[0] if parts else s
+    endereco = endereco.strip(" ,-")
+    if numero:
+        # se já tem número no endereço, não duplica
+        if not re.search(r"\b\d+\b", endereco):
+            endereco = f"{endereco}, {numero}"
 
-    # aceita hífen normal e travessões
-    dash_parts = re.split(r"\s*[-–—]\s*", seg_txt)
-    if len(dash_parts) >= 2:
-        left = " - ".join(dash_parts[:-1]).strip()
-        right = dash_parts[-1].strip()
-
-        # número pode vir como "64", "1.235", ou "64 302" (complemento)
-        mnum = re.match(r"^([\d\.]+)", left)
-        num_raw = (mnum.group(1) if mnum else "").strip()
-        num = re.sub(r"\D", "", num_raw) or num_raw
-
-        # bairro: sempre o último pedaço após o hífen/travessão
-        b = right
-        # se vier "complemento - bairro", pega o ÚLTIMO como bairro
-        if b and (" - " in b):
-            b = b.split(" - ")[-1].strip()
-
-        if num and num not in endereco:
-            endereco = f"{endereco}, {num}".strip().strip(",")
-        if not bairro and b:
-            bairro = b
-        return True
-
-    # somente número (com ou sem ponto)
-    if re.fullmatch(r"[\d\.]+", seg_txt):
-        num = seg_txt_txt
-        if num and num not in endereco:
-            endereco = f"{endereco}, {num}".strip().strip(",")
-        return True
-
-    return False
-
-    if len(parts) >= 2:
-        # se parts[1] é número/bairro, aplica
-        _apply_num_bairro(parts[1])
-
-    # 5) Se ainda não tiver bairro, tenta pegar o item imediatamente antes da cidade
-    if not bairro and city_idx is not None and city_idx - 1 >= 1:
-        cand = parts[city_idx - 1].strip()
-        # pode ser "31 - Ipanema" ou só "Ipanema"
-        if not _apply_num_bairro(cand):
-            if cand and not re.search(r"\s-\s*[A-Z]{2}\b", cand) and (not cep or cep not in cand):
-                # evita pegar o próprio endereço
-                if cand != endereco:
-                    bairro = cand
-
-    # 6) Caso ainda esteja vazio e exista parts[2], use como bairro (quando não for cidade)
-    if not bairro and len(parts) >= 3:
-        cand = parts[2].strip()
-        if cand and not re.search(r"\s-\s*[A-Z]{2}\b", cand) and (not cep or cep not in cand):
-            # evita repetir cidade
-            if cand != cidade:
-                bairro = cand
-
-    # 7) Limpeza final
-    if cep:
-        cidade = cidade.replace(cep, "").strip(" ,")
-        bairro = bairro.replace(cep, "").strip(" ,")
-
-    return (endereco, bairro, cidade, cep)
-
-
+    # Limpeza final do bairro (remove complementos se ainda vierem grudados)
+    if bairro:
+        # Se ainda vier algo do tipo "sala 303 - Leblon", pega o último novamente
+        if " - " in bairro:
+            bairro = bairro.split(" - ")[-1].strip()
+        # Remove pontuação excessiva
+        bairro = bairro.strip(" ,-")
+    return endereco, bairro, cep
 
 def _get_endereco_fields(row):
     """
@@ -1679,7 +1618,7 @@ def main():
     # ===============================
     CATEGORIES_CONFIG = {
         "🛒 Mercados": {"google_type": "supermarket", "osm": ["shop=supermarket", "shop=convenience", "shop=grocery"]},
-        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual","municipal","ciep","CIEP"]},
+        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual"]},
         "🏫 Faculdades/Universidades": {"google_type": "school", "osm": ["amenity=university"]},
         # "🏗️ Construtoras": {"google_type": "general_contractor", "osm": ["office=construction", "craft=builder", "office=architect"]},
         "🏥 Hospitais": {"google_type": "hospital", "osm": ["amenity=hospital", "amenity=clinic", "amenity=doctors"]},
