@@ -54,13 +54,17 @@ from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 import sys
 import os
+import io
+import hashlib
 
 # ===============================
 # GOOGLE SHEETS - PADRÕES
 # ===============================
 DEFAULT_GSHEET_ID = (os.getenv("GSHEET_ID", "106O5MwhhB9LV55tXnJTq4kObNNt0LU4jQmEsxGDCrlg") or "106O5MwhhB9LV55tXnJTq4kObNNt0LU4jQmEsxGDCrlg").strip()
 DEFAULT_GSHEET_TAB = (os.getenv("GSHEET_TAB", "Clientes") or "Clientes").strip()
-_GS_EXPORT_HEADERS = ["Segmento", "Executiva Pixel", "Empresa (Cliente)", "Responsável Empresa", "Telefone", "Já fiz contato?", "Data de contato", "Observações", "E-mail", "Endereço", "Bairro", "CEP", "Atualizado em"]
+_GS_FIXED_HEADERS = ["ID_CLIENTE", "Segmento"]
+_GS_DYNAMIC_HEADERS = ["Segmento_TXT", "Executiva Pixel", "Empresa (Cliente)", "Responsável pela Empresa", "Telefone", "E-mail", "Já fiz contato?", "Data de contato", "Observações", "Site", "Endereço", "Bairro", "CEP", "Atualizado em", "Foto", "Foto_AppSheet"]
+_GS_EXPORT_HEADERS = _GS_FIXED_HEADERS + _GS_DYNAMIC_HEADERS
 
 
 
@@ -69,7 +73,7 @@ _GS_EXPORT_HEADERS = ["Segmento", "Executiva Pixel", "Empresa (Cliente)", "Respo
 # ===============================
 # Se vazio/None, aceita qualquer UF.
 # Exemplo para restringir: ALLOWED_UF = {"RJ", "SP"}
-ALLOWED_UF: dict[str, str] = {"RJ": "Rio de Janeiro"}  # UF -> nome do estado (edite conforme necessário)
+ALLOWED_UF = set()  # type: set[str]
 
 import subprocess
 import socket
@@ -83,11 +87,19 @@ try:
 except Exception:
     ZoneInfo = None
 
+try:
+    from PIL import Image as PILImage
+except Exception:
+    PILImage = None
+
 from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as XLImage
 
 try:
     import gspread
     from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload
 except Exception:
     gspread = None
     Credentials = None
@@ -177,7 +189,7 @@ def add_address_to_history(addr: str, limit: int = 25) -> None:
 EXPORT_TEMPLATE_FILENAME = "Prospecção Vanessa Pixel Rio.xlsx"
 DEFAULT_EXPORT_SHEET_NAME = "Moinho clientes"
 
-_EXPORT_REQUIRED_HEADERS = ["Segmento", "Cliente", "Responsável", "Contato", "Já fiz contato?", "Data de contato", "E-mail", "Endereço", "CEP", "Atualizado em", "Executiva"]
+_EXPORT_REQUIRED_HEADERS = ["Segmento", "Cliente", "Responsável", "Contato", "Já fiz contato?", "Data de contato", "E-mail", "Endereço", "CEP", "Atualizado em", "Executiva", "Foto"]
 def _norm_header(v) -> str:
     if v is None:
         return ""
@@ -460,6 +472,17 @@ def _get_email_or_site(row) -> str:
     return site if site and site != "-" else ""
 
 
+def _get_site_row(row) -> str:
+    """Retorna somente o site/URL da empresa, sem misturar com e-mail."""
+    for key in ["Website", "Site", "URL", "Url", "url", "Maps"]:
+        v = _clean_text(row.get(key) if hasattr(row, "get") else "")
+        if v and v != "-":
+            if _extract_email_from_text(v):
+                continue
+            return v
+    return ""
+
+
 def _extract_cep(text: str) -> str:
     s = _clean_text(text)
     if not s:
@@ -486,105 +509,117 @@ def _clean_endereco_full(s: str) -> str:
     return s
 
 
+
 def _split_endereco_brasil(full: str):
-    """Extrai (endereco, bairro, cidade_uf, cep) de um endereço BR.
-
-    Retorno SEMPRE com 4 valores para uso em _get_endereco_fields():
-      - endereco: rua + número (quando possível)
-      - bairro: somente o bairro (ex.: "Leblon")
-      - cidade_uf: segmento "Cidade - UF" (ex.: "Rio de Janeiro - RJ") quando identificado, senão ""
-      - cep: "00000-000" quando identificado, senão ""
-
-    Regras (cirúrgicas):
-    - CEP: 00000-000 ou 00000000
-    - Bairro: prioriza o último trecho após hífen/travessão em segmentos como:
-        "64 302 - Leblon" -> "Leblon"
-        "1.235 - sala 303 - Leblon" -> "Leblon"
-    - Cidade/UF: identifica o primeiro segmento que contém " - UF" para localizar o bairro no item anterior.
     """
-    s = (full or "").strip()
-    if not s:
-        return "", "", "", ""
+    Heurística para Google formatted_address / strings de endereço no Brasil.
+    Retorna: (endereco_rua_num, bairro, cidade, cep)
 
-    # Normaliza espaços e remove país no final
-    s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"\s*,\s*Brasil\s*$", "", s, flags=re.IGNORECASE).strip()
+    Casos comuns do Google:
+      "R. Teixeira de Melo, 31 - Ipanema, Rio de Janeiro - RJ, 22410-001, Brasil"
+      "Av. Brasil, 5000 - Bonsucesso, Rio de Janeiro - RJ, 21040-360, Brasil"
+    """
+    s = _clean_text(full)
+    if not s or s.lower().startswith("endereço não"):
+        return (s, "", "", "")
 
-    # CEP
-    cep = ""
-    m = re.search(r"\b\d{5}-\d{3}\b", s)
-    if m:
-        cep = m.group(0)
-        s = (s[:m.start()] + s[m.end():]).strip(" ,-")
+    cep = _extract_cep(s)
+
+    parts = [p.strip() for p in s.split(",") if p and p.strip()]
+    parts = [p for p in parts if p.lower() not in ("brasil",)]
+
+    endereco = ""
+    bairro = ""
+    cidade = ""
+
+    if not parts:
+        return (s, "", "", cep)
+
+    # 1) Endereço base (rua/av)
+    first = parts[0].strip()
+    # Caso: "Rua X, 123 - Bairro" vem inteiro no first
+    if " - " in first:
+        left, right = first.split(" - ", 1)
+        endereco = left.strip()
+        # se o lado esquerdo já tem número, ótimo; se não, vamos tentar adicionar depois
+        if right and not re.search(r"\s-\s*[A-Z]{2}\b", right):
+            bairro = right.strip()
     else:
-        m2 = re.search(r"\b\d{8}\b", s)
-        if m2:
-            raw = m2.group(0)
-            cep = f"{raw[:5]}-{raw[5:]}"
-            s = (s[:m2.start()] + s[m2.end():]).strip(" ,-")
+        endereco = first
 
-    # Quebra por vírgulas (formato mais comum de geocoders)
-    parts = [p.strip() for p in s.split(",") if p.strip()]
-
-    # Localiza cidade/UF (ex.: "Rio de Janeiro - RJ")
+    # 2) Detecta cidade (preferência: "Cidade - UF")
     city_idx = None
     for i, p in enumerate(parts):
         if re.search(r"\s-\s*[A-Z]{2}\b", p):
+            cidade = re.sub(r"\s-\s*[A-Z]{2}\b.*$", "", p).strip()
             city_idx = i
             break
 
-    cidade_uf = parts[city_idx] if city_idx is not None else ""
+    # 3) Se ainda não achou cidade: pega o último item "útil" (antes do CEP)
+    if not cidade:
+        for p in reversed(parts):
+            if cep and cep in p:
+                continue
+            if re.fullmatch(r"\d{5}-\d{3}", p) or re.fullmatch(r"\d{8}", p):
+                continue
+            if p.lower() == "brasil":
+                continue
+            cidade = p.strip()
+            city_idx = parts.index(p)
+            break
 
-    def _extract_bairro_from_segment(seg: str) -> str:
-        seg = (seg or "").strip()
-        if not seg:
-            return ""
-        # separa por hífen/travessão; bairro é SEMPRE o último pedaço
-        dash_parts = [x.strip() for x in re.split(r"\s*[-–—]\s*", seg) if x.strip()]
-        if len(dash_parts) >= 2:
-            return dash_parts[-1]
-        return ""
+    # 4) Número + Bairro costumam vir no 2º item: "31 - Ipanema" ou "31" ou "31 - Bairro"
+    def _apply_num_bairro(segment: str):
+        nonlocal endereco, bairro
+        seg = segment.strip()
+        mnb = re.match(r"^(\d+)\s*-\s*(.+)$", seg)
+        if mnb:
+            num = mnb.group(1).strip()
+            rest = mnb.group(2).strip()
+            # quando vier "num - complemento - bairro", pega o ÚLTIMO como bairro
+            b = rest.split(" - ")[-1].strip() if " - " in rest else rest
+            if num and num not in endereco:
+                endereco = f"{endereco}, {num}".strip().strip(",")
+            if not bairro and b:
+                bairro = b
+            return True
+        if re.fullmatch(r"\d+", seg):
+            num = seg
+            if num and num not in endereco:
+                endereco = f"{endereco}, {num}".strip().strip(",")
+            return True
+        return False
 
-    def _extract_num_from_left(seg: str) -> str:
-        seg = (seg or "").strip()
-        if not seg:
-            return ""
-        # pega o início numérico, aceitando ponto e blocos ("64 302" ou "1.235")
-        mnum = re.match(r"^([\d\.]+(?:\s+[\d\.]+)*)", seg)
-        if not mnum:
-            return ""
-        return mnum.group(1).strip()
+    if len(parts) >= 2:
+        # se parts[1] é número/bairro, aplica
+        _apply_num_bairro(parts[1])
 
-    # Candidato a segmento de bairro: normalmente o item anterior à cidade/UF
-    cand_seg = ""
-    if city_idx is not None and city_idx - 1 >= 0:
-        cand_seg = parts[city_idx - 1]
-    elif len(parts) >= 2:
-        cand_seg = parts[1]
+    # 5) Se ainda não tiver bairro, tenta pegar o item imediatamente antes da cidade
+    if not bairro and city_idx is not None and city_idx - 1 >= 1:
+        cand = parts[city_idx - 1].strip()
+        # pode ser "31 - Ipanema" ou só "Ipanema"
+        if not _apply_num_bairro(cand):
+            if cand and not re.search(r"\s-\s*[A-Z]{2}\b", cand) and (not cep or cep not in cand):
+                # evita pegar o próprio endereço
+                if cand != endereco:
+                    bairro = cand
 
-    bairro = _extract_bairro_from_segment(cand_seg)
+    # 6) Caso ainda esteja vazio e exista parts[2], use como bairro (quando não for cidade)
+    if not bairro and len(parts) >= 3:
+        cand = parts[2].strip()
+        if cand and not re.search(r"\s-\s*[A-Z]{2}\b", cand) and (not cep or cep not in cand):
+            # evita repetir cidade
+            if cand != cidade:
+                bairro = cand
 
-    # Se candidato tem número antes do hífen, captura
-    numero = ""
-    if cand_seg:
-        left = re.split(r"[-–—]", cand_seg, maxsplit=1)[0].strip()
-        numero = _extract_num_from_left(left)
+    # 7) Limpeza final
+    if cep:
+        cidade = cidade.replace(cep, "").strip(" ,")
+        bairro = bairro.replace(cep, "").strip(" ,")
 
-    # Endereço base: primeiro item é a rua/avenida
-    endereco = parts[0] if parts else s
-    endereco = endereco.strip(" ,-")
-    if numero:
-        # se já tem número no endereço, não duplica
-        if not re.search(r"\b\d+[\d\.]*\b", endereco):
-            endereco = f"{endereco}, {numero}"
+    return (endereco, bairro, cidade, cep)
 
-    # Limpeza final do bairro
-    if bairro:
-        # Se ainda vier algo do tipo "sala 303 - Leblon", pega o último novamente
-        if re.search(r"\s*[-–—]\s*", bairro):
-            bairro = re.split(r"\s*[-–—]\s*", bairro)[-1].strip()
-        bairro = bairro.strip(" ,-")
-    return endereco, bairro, cidade_uf, cep
+
 
 def _get_endereco_fields(row):
     """
@@ -620,6 +655,100 @@ def _get_endereco_fields(row):
 
 
 
+
+
+# ===============================
+# FOTO (1 por empresa) para Google Sheets
+# - Preferência: Street View (fachada) quando houver cobertura
+# - Fallback: Places Photo (melhor foto disponível)
+# ===============================
+
+@st.cache_data(ttl=24*3600)
+def _streetview_has_pano(lat: float, lon: float, api_key: str) -> bool:
+    if not api_key:
+        return False
+    try:
+        url = "https://maps.googleapis.com/maps/api/streetview/metadata"
+        params = {"location": f"{lat},{lon}", "radius": 80, "source": "outdoor", "key": api_key}
+        r = requests.get(url, params=params, timeout=15)
+        j = r.json() if r.ok else {}
+        return (j.get("status") == "OK")
+    except Exception:
+        return False
+
+
+def _streetview_static_url(lat: float, lon: float, api_key: str, size: str = "640x360") -> str:
+    # heading/pitch neutros; prioriza outdoor
+    return (
+        "https://maps.googleapis.com/maps/api/streetview"
+        f"?size={size}&location={lat},{lon}&radius=80&source=outdoor&fov=90&pitch=0&key={api_key}"
+    )
+
+
+def _places_photo_url(photo_reference: str, api_key: str, maxwidth: int = 1200) -> str:
+    return (
+        "https://maps.googleapis.com/maps/api/place/photo"
+        f"?maxwidth={int(maxwidth)}&photo_reference={photo_reference}&key={api_key}"
+    )
+
+
+from functools import lru_cache
+
+@lru_cache(maxsize=4096)
+def _resolve_redirect_url(url: str) -> str:
+    """Resolve redirects (302) and return final URL.
+
+    Motivação: o Google Sheets (função IMAGE) pode não seguir redirect/URL com key,
+    e chaves com restrição de referrer podem falhar. Ao resolver o redirect do
+    endpoint /place/photo, obtemos uma URL final (googleusercontent) que costuma
+    funcionar bem no Sheets.
+    """
+    try:
+        r = requests.get(url, allow_redirects=False, timeout=15)
+        # Places Photo normalmente retorna 302 com header Location
+        loc = r.headers.get("Location") or r.headers.get("location")
+        if loc:
+            return loc
+    except Exception:
+        pass
+    return url
+
+
+
+def _best_company_photo_url(row, api_key: str) -> str:
+    """Retorna UMA URL de imagem para exportar no Google Sheets.
+
+    Estratégia (mais compatível com =IMAGE no Sheets):
+    1) Tenta Places Photo (PhotoRef) e resolve redirect para URL final (googleusercontent).
+       -> normalmente funciona melhor no Sheets do que a URL com key (maps.googleapis.com).
+    2) Fallback: Street View Static (fachada), se houver panorama.
+    """
+    if not api_key:
+        return ""
+
+    # 1) Places Photo (preferido para Sheets)
+    try:
+        pref = (row.get("PhotoRef") if hasattr(row, "get") else "") or ""
+        pref = str(pref).strip()
+        if pref:
+            url = _places_photo_url(pref, api_key, maxwidth=1200)
+            return _resolve_redirect_url(url)
+    except Exception:
+        pass
+
+    # 2) Street View (fachada) - fallback
+    try:
+        lat = row.get("Latitude") if hasattr(row, "get") else None
+        lon = row.get("Longitude") if hasattr(row, "get") else None
+        lat = float(lat) if lat not in (None, "", "nan") else None
+        lon = float(lon) if lon not in (None, "", "nan") else None
+    except Exception:
+        lat, lon = None, None
+
+    if lat is not None and lon is not None and _streetview_has_pano(lat, lon, api_key):
+        return _streetview_static_url(lat, lon, api_key)
+
+    return ""
 
 def _extract_email_from_text(s: str) -> str:
     s = _clean_text(s)
@@ -732,6 +861,153 @@ def _pick_row_value(row, candidates):
     return ""
 
 
+
+def fetch_place_photo_bytes_export(photo_reference: str, api_key: str, maxwidth: int = 520):
+    """Versão top-level da lógica de foto usada na tela, para exportações."""
+    if not photo_reference or not api_key:
+        return None
+    url = "https://maps.googleapis.com/maps/api/place/photo"
+    params = {"maxwidth": int(maxwidth), "photo_reference": photo_reference, "key": api_key}
+    try:
+        r = requests.get(url, params=params, timeout=20, allow_redirects=True)
+        if r.status_code == 200 and r.content:
+            return r.content
+    except Exception:
+        return None
+    return None
+
+
+def _get_photo_bytes_for_export(row, api_key_for_photo: str):
+    """Retorna (img_bytes, mime_type) usando a mesma prioridade visual da tela."""
+    try:
+        api_key_for_photo = (api_key_for_photo or "").strip()
+        if not api_key_for_photo:
+            return (None, None)
+
+        photo_ref = str((row.get("PhotoRef") if hasattr(row, "get") else "") or "").strip()
+        if photo_ref:
+            img_bytes = fetch_place_photo_bytes_export(photo_ref, api_key_for_photo, maxwidth=1200)
+            if img_bytes:
+                return (img_bytes, "image/jpeg")
+
+        foto_url = _best_company_photo_url(row, api_key=api_key_for_photo)
+        if foto_url:
+            return _download_image_bytes(foto_url)
+    except Exception:
+        pass
+    return (None, None)
+
+
+
+
+def _photo_public_url_for_row(row, api_key_for_photo: str) -> str:
+    """Retorna a URL pública direta da foto para uso no AppSheet.
+
+    Prioridade:
+    1) URL final resolvida do Places Photo (googleusercontent), mais compatível com AppSheet.
+    2) Fallback para a melhor URL pública disponível.
+    """
+    try:
+        api_key_for_photo = (api_key_for_photo or "").strip()
+        if not api_key_for_photo:
+            return ""
+
+        if "photo_public_url_cache" not in st.session_state:
+            st.session_state.photo_public_url_cache = {}
+        cache: dict = st.session_state.photo_public_url_cache
+
+        place_id = ""
+        if hasattr(row, "get"):
+            place_id = str(row.get("PlaceId") or row.get("place_id") or "").strip()
+        nome = str(row.get("Nome") if hasattr(row, "get") else "")[:80].strip() or "empresa"
+        endereco_key = str(row.get("Endereço") if hasattr(row, "get") else "")
+        key = place_id or hashlib.md5((nome + endereco_key).encode("utf-8", errors="ignore")).hexdigest()
+
+        if key in cache:
+            return cache[key] or ""
+
+        public_url = ""
+        photo_ref = str((row.get("PhotoRef") if hasattr(row, "get") else "") or "").strip()
+        if photo_ref:
+            try:
+                direct_url = _resolve_redirect_url(_places_photo_url(photo_ref, api_key_for_photo, maxwidth=1600))
+                if direct_url and any(x in direct_url for x in ("googleusercontent.com", "ggpht.com", "googleapis.com")):
+                    public_url = direct_url
+            except Exception:
+                pass
+
+        if not public_url:
+            public_url = _best_company_photo_url(row, api_key=api_key_for_photo) or ""
+
+        cache[key] = public_url
+        return public_url
+    except Exception:
+        return ""
+
+
+def _insert_excel_image(ws, cell_ref: str, img_bytes: bytes, mime_type: str = "image/jpeg", max_width_px: int = 150, max_height_px: int = 100):
+    """Insere imagem no Excel ancorada na célula indicada.
+
+    Observação importante: o openpyxl não lida bem com PIL.Image já redimensionada/copied,
+    porque em algumas situações o objeto perde o atributo interno ``fp`` e o save do workbook
+    quebra com: ``'Image' object has no attribute 'fp'``.
+    Por isso, aqui a imagem é sempre normalizada e regravada em um BytesIO antes de virar XLImage.
+    """
+    if not img_bytes or PILImage is None:
+        return False
+    try:
+        src_bio = BytesIO(img_bytes)
+        pil = PILImage.open(src_bio)
+        pil.load()
+
+        width, height = pil.size
+        if width <= 0 or height <= 0:
+            return False
+
+        scale = min(max_width_px / float(width), max_height_px / float(height), 1.0)
+        new_w = max(1, int(width * scale))
+        new_h = max(1, int(height * scale))
+
+        if pil.mode not in ("RGB", "RGBA"):
+            pil = pil.convert("RGBA" if "A" in getattr(pil, 'getbands', lambda: [])() else "RGB")
+
+        if scale < 1.0:
+            pil = pil.copy()
+            pil.thumbnail((new_w, new_h), resample=getattr(PILImage, 'LANCZOS', 1))
+
+        has_alpha = "A" in getattr(pil, 'getbands', lambda: [])()
+        out_bio = BytesIO()
+        if has_alpha:
+            pil.save(out_bio, format="PNG")
+            out_bio.name = "image.png"
+        else:
+            if pil.mode != "RGB":
+                pil = pil.convert("RGB")
+            pil.save(out_bio, format="JPEG", quality=92)
+            out_bio.name = "image.jpg"
+        out_bio.seek(0)
+
+        img = XLImage(out_bio)
+        img.width = new_w
+        img.height = new_h
+        img.anchor = cell_ref
+        ws.add_image(img)
+
+        col_letters = ''.join(ch for ch in cell_ref if ch.isalpha())
+        row_digits = ''.join(ch for ch in cell_ref if ch.isdigit())
+        if col_letters:
+            current_w = ws.column_dimensions[col_letters].width
+            desired_w = max((current_w or 8.43), round((new_w + 20) / 7, 2))
+            ws.column_dimensions[col_letters].width = desired_w
+        if row_digits:
+            row_idx = int(row_digits)
+            current_h = ws.row_dimensions[row_idx].height
+            desired_h = max((current_h or 15), round((new_h * 0.78) + 8, 1))
+            ws.row_dimensions[row_idx].height = desired_h
+        return True
+    except Exception:
+        return False
+
 def export_results_incremental_xlsx(
     df,
     template_bytes: bytes,
@@ -739,10 +1015,14 @@ def export_results_incremental_xlsx(
     executiva: str = "Vanessa",
     updated_dt: datetime = None,
     dedup: bool = True,
+    google_api_key_for_photo: str = "",
 ):
     """
-    Exporta incrementalmente para Excel na ordem exata:
-    Segmento | Cliente | Responsável | Contato | E-mail | Endereço | Atualizado em | Executiva
+    Exporta incrementalmente para Excel no layout:
+    Segmento | Cliente | Responsável | Contato | Já fiz contato? | Data de contato |
+    E-mail | Endereço | CEP | Atualizado em | Executiva | Foto
+
+    A foto é inserida como imagem embutida no .xlsx usando a mesma lógica visual da tela.
     """
     wb = load_workbook(BytesIO(template_bytes))
     if sheet_name not in wb.sheetnames:
@@ -752,13 +1032,13 @@ def export_results_incremental_xlsx(
     header_row, col_map = _find_header_row(ws, scan_rows=40, scan_cols=80)
 
     # Migração de template antigo (com Bairro/Cidade) para o novo layout:
-    # Segmento | Cliente | Responsável | Contato | Já fiz contato? | Data de contato | E-mail | Endereço | Bairro | CEP | Atualizado em | Executiva
+    # Segmento | Cliente | Responsável | Contato | Já fiz contato? | Data de contato | E-mail | Endereço | CEP | Atualizado em | Executiva | Foto
     try:
         old_headers = ["Segmento", "Cliente", "Responsável", "Contato", "E-mail", "Endereço", "Bairro", "Cidade", "CEP", "Atualizado em", "Executiva"]
         expected_headers = _EXPORT_REQUIRED_HEADERS
 
         if header_row is not None:
-            cur = [ws.cell(header_row, c).value for c in range(1, 12)]
+            cur = [ws.cell(header_row, c).value for c in range(1, 13)]
             cur_norm = [_norm_header(x) for x in cur]
             old_norm = [_norm_header(x) for x in old_headers]
 
@@ -814,6 +1094,7 @@ def export_results_incremental_xlsx(
         else:
             updated_dt = datetime.now()
     updated_str = updated_dt.strftime("%d/%m/%Y %H:%M:%S")
+    google_api_key_for_photo = (google_api_key_for_photo or os.getenv("GOOGLE_API_KEY", "") or _safe_secrets_get("GOOGLE_API_KEY", "") or "").strip()
 
     last_existing = _last_filled_row_any(ws, header_row, [cols["Cliente"]])
 
@@ -840,6 +1121,7 @@ def export_results_incremental_xlsx(
 
     added = 0
     skipped = 0
+    pending_photos = {}
 
     for _, row in df.iterrows():
         segmento = str(_pick_row_value(row, ["Categoria", "Segmento"])).strip()
@@ -861,6 +1143,12 @@ def export_results_incremental_xlsx(
             skipped += 1
             continue
 
+        foto_bytes = None
+        if google_api_key_for_photo:
+            foto_bytes, _foto_mime = _get_photo_bytes_for_export(row, google_api_key_for_photo)
+            if foto_bytes and key != ("", ""):
+                pending_photos[key] = foto_bytes
+
         rr = start_row + added
         ws.cell(rr, cols["Segmento"]).value = segmento
         ws.cell(rr, cols["Cliente"]).value = cliente
@@ -873,22 +1161,24 @@ def export_results_incremental_xlsx(
         ws.cell(rr, cols["CEP"]).value = cep
         ws.cell(rr, cols["Atualizado em"]).value = updated_str
         ws.cell(rr, cols["Executiva"]).value = executiva
+        ws.cell(rr, cols["Foto"]).value = "Imagem" if (foto_bytes if "foto_bytes" in locals() else None) else ""
 
         added += 1
         if dedup and key != ("", ""):
             existing.add(key)
 
-    # Ordenar por Segmento (Apenas colunas do schema) - deixa a planilha organizada
+    # Ordenar por Segmento somente quando a aba ainda não tiver imagens, para não desalinhar fotos já embutidas.
     try:
-        if added > 0:
-            seg_col_idx = cols.get("Segmento")
-            if seg_col_idx:
-                last_row = _last_filled_row_any(ws, header_row, [cols.get("Cliente"), cols.get("Contato"), seg_col_idx])
+        existing_images = list(getattr(ws, "_images", []) or [])
+        if added > 0 and not pending_photos and not existing_images:
+            seg_col = cols.get("Segmento")
+            if seg_col:
+                last_row = _last_filled_row_any(ws, header_row, [cols.get("Cliente"), cols.get("Contato"), seg_col])
                 data_rows = []
                 for r in range(header_row + 1, last_row + 1):
                     row_vals = [ws.cell(r, cols[h]).value if cols.get(h) else None for h in _EXPORT_REQUIRED_HEADERS]
                     data_rows.append(row_vals)
-                data_rows.sort(key=lambda rv: str(rv[0] or "").strip().lower())  # Segmento é o 1º campo
+                data_rows.sort(key=lambda rv: str(rv[0] or "").strip().lower())
                 for i, rv in enumerate(data_rows, start=header_row + 1):
                     for j, h in enumerate(_EXPORT_REQUIRED_HEADERS):
                         c = cols.get(h)
@@ -913,8 +1203,25 @@ def export_results_incremental_xlsx(
         pass
 
 
-
-
+    # Inserção de imagens no Excel após a escrita das linhas.
+    try:
+        foto_col = cols.get("Foto")
+        if foto_col and pending_photos:
+            for r in range(header_row + 1, (ws.max_row or header_row) + 1):
+                cliente0 = ws.cell(r, cols["Cliente"]).value if cols.get("Cliente") else ""
+                contato0 = ws.cell(r, cols["Contato"]).value if cols.get("Contato") else ""
+                email0 = ws.cell(r, cols["E-mail"]).value if cols.get("E-mail") else ""
+                endereco0 = ws.cell(r, cols["Endereço"]).value if cols.get("Endereço") else ""
+                row_key = _dedup_key(str(cliente0 or ""), str(contato0 or ""), str(email0 or ""), str(endereco0 or ""))
+                img_bytes = pending_photos.get(row_key)
+                if not img_bytes:
+                    continue
+                cell_ref = f"{ws.cell(header_row, foto_col).column_letter}{r}"
+                ok = _insert_excel_image(ws, cell_ref, img_bytes, "image/jpeg")
+                if ok:
+                    ws.cell(r, foto_col).value = "Imagem"
+    except Exception:
+        pass
 
     out = BytesIO()
     wb.save(out)
@@ -970,7 +1277,7 @@ def _get_gspread_client(sa_info_override: dict | None = None, cred_path_override
 
     # Override (uso local): JSON enviado via UI ou caminho digitado pelo usuário
     if sa_info_override:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.file"]
         creds = Credentials.from_service_account_info(sa_info_override, scopes=scopes)
         return gspread.authorize(creds)
 
@@ -987,7 +1294,7 @@ def _get_gspread_client(sa_info_override: dict | None = None, cred_path_override
         sa_info = None
 
     if sa_info:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.file"]
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         return gspread.authorize(creds)
 
@@ -995,7 +1302,7 @@ def _get_gspread_client(sa_info_override: dict | None = None, cred_path_override
     if env_json:
         import json as _json
         sa_info = _json.loads(env_json)
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.file"]
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         return gspread.authorize(creds)
 
@@ -1024,19 +1331,246 @@ def _gs_norm(v) -> str:
     return ("" if v is None else str(v)).strip().lower()
 
 
+# ===============================
+# GOOGLE DRIVE (para salvar fotos e usar =IMAGE no Sheets)
+# ===============================
+
+def _get_drive_service(sa_info_override: dict | None = None, cred_path_override: str | None = None):
+    """Cria um service do Google Drive usando o mesmo Service Account do Sheets."""
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.file"]
+
+    if sa_info_override:
+        creds = Credentials.from_service_account_info(sa_info_override, scopes=scopes)
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    sa_info = None
+    try:
+        if _safe_secrets_has("gcp_service_account"):
+            sa_info = dict(_safe_secrets_get("gcp_service_account"))
+        elif _safe_secrets_has("google_service_account"):
+            sa_info = dict(_safe_secrets_get("google_service_account"))
+        elif _safe_secrets_has("service_account"):
+            sa_info = dict(_safe_secrets_get("service_account") or {})
+    except Exception:
+        sa_info = None
+
+    if sa_info:
+        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    env_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if env_json:
+        import json as _json
+        sa_info = _json.loads(env_json)
+        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    if cred_path_override and os.path.exists(cred_path_override):
+        creds = Credentials.from_service_account_file(cred_path_override, scopes=scopes)
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    env_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if env_path and os.path.exists(env_path):
+        creds = Credentials.from_service_account_file(env_path, scopes=scopes)
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    try:
+        local_fp = os.path.join(_app_base_dir(), "service_account.json")
+        if os.path.exists(local_fp):
+            creds = Credentials.from_service_account_file(local_fp, scopes=scopes)
+            return build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception:
+        pass
+
+    for p in ["service_account.json", "credentials.json", "sa.json"]:
+        if os.path.exists(p):
+            creds = Credentials.from_service_account_file(p, scopes=scopes)
+            return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    raise RuntimeError("Service Account não encontrado para Drive (st.secrets ou arquivo local).")
+
+
+def _drive_get_or_create_folder_id(
+    folder_name: str,
+    sa_info_override: dict | None = None,
+    cred_path_override: str | None = None,
+) -> str:
+    """Cria/obtém uma pasta no Drive do Service Account."""
+    try:
+        if "drive_folder_cache" not in st.session_state:
+            st.session_state.drive_folder_cache = {}
+        cache: dict = st.session_state.drive_folder_cache
+
+        cred_key = "default"
+        if sa_info_override:
+            cred_key = str((sa_info_override.get("client_email") or "override")).strip().lower()
+        elif cred_path_override:
+            cred_key = os.path.abspath(cred_path_override)
+
+        cache_key = f"{cred_key}|{folder_name.strip().lower()}"
+        if cache_key in cache and cache[cache_key]:
+            return cache[cache_key]
+    except Exception:
+        cache = {}
+        cache_key = folder_name.strip().lower()
+
+    svc = _get_drive_service(sa_info_override=sa_info_override, cred_path_override=cred_path_override)
+    safe_name = folder_name.replace("'", "\'")
+    q = (
+        f"name='{safe_name}' and "
+        "mimeType='application/vnd.google-apps.folder' and trashed=false"
+    )
+    res = svc.files().list(q=q, fields="files(id,name)", pageSize=10).execute()
+    files = res.get("files", [])
+    if files:
+        folder_id = files[0]["id"]
+        try:
+            cache[cache_key] = folder_id
+        except Exception:
+            pass
+        return folder_id
+
+    meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
+    created = svc.files().create(body=meta, fields="id").execute()
+    folder_id = created["id"]
+    try:
+        cache[cache_key] = folder_id
+    except Exception:
+        pass
+    return folder_id
+
+
+def _drive_upload_image_and_get_public_url(
+    image_bytes: bytes,
+    filename: str,
+    folder_id: str,
+    mime_type: str = "image/jpeg",
+    sa_info_override: dict | None = None,
+    cred_path_override: str | None = None,
+) -> str:
+    """Upload da imagem no Drive e retorna um link direto para =IMAGE no Sheets."""
+    svc = _get_drive_service(sa_info_override=sa_info_override, cred_path_override=cred_path_override)
+
+    media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype=mime_type, resumable=False)
+    file_metadata = {"name": filename, "parents": [folder_id]}
+    created = svc.files().create(body=file_metadata, media_body=media, fields="id").execute()
+    file_id = created["id"]
+
+    try:
+        svc.permissions().create(
+            fileId=file_id,
+            body={"type": "anyone", "role": "reader"},
+            fields="id",
+        ).execute()
+    except Exception:
+        pass
+
+    return f"https://drive.google.com/uc?export=view&id={file_id}"
+
+
+def _download_image_bytes(url: str) -> tuple[bytes, str] | tuple[None, None]:
+    """Baixa a imagem e retorna (bytes, mime_type)."""
+    try:
+        r = requests.get(url, timeout=25, allow_redirects=True, stream=True)
+        if r.status_code != 200:
+            return (None, None)
+        ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if not ctype.startswith("image/"):
+            return (None, None)
+        content = r.content
+        if not content:
+            return (None, None)
+        return (content, ctype or "image/jpeg")
+    except Exception:
+        return (None, None)
+
+
+def _photo_cell_formula_for_row(
+    row,
+    api_key_for_photo: str,
+    sa_info_override: dict | None = None,
+    cred_path_override: str | None = None,
+) -> str:
+    """Retorna a fórmula =IMAGE(...) para o Google Sheets.
+
+    Mantém a estratégia mais estável:
+    1) tenta o fluxo já validado do Drive para o Sheets;
+    2) se falhar, usa a URL pública direta da foto.
+    """
+    try:
+        api_key_for_photo = (api_key_for_photo or "").strip()
+        if not api_key_for_photo:
+            return ""
+
+        if "photo_cache" not in st.session_state:
+            st.session_state.photo_cache = {}
+        cache: dict = st.session_state.photo_cache
+
+        place_id = ""
+        if hasattr(row, "get"):
+            place_id = str(row.get("PlaceId") or row.get("place_id") or "").strip()
+        nome = str(row.get("Nome") if hasattr(row, "get") else "")[:80].strip() or "empresa"
+        endereco_key = str(row.get("Endereço") if hasattr(row, "get") else "")
+        key = place_id or hashlib.md5((nome + endereco_key).encode("utf-8", errors="ignore")).hexdigest()
+
+        if key in cache:
+            url = cache[key]
+            return f'=IMAGE("{url}")' if url else ""
+
+        img_bytes, mime = _get_photo_bytes_for_export(row, api_key_for_photo)
+        if img_bytes:
+            folder_id = _drive_get_or_create_folder_id(
+                "Fotos - Info Comercial",
+                sa_info_override=sa_info_override,
+                cred_path_override=cred_path_override,
+            )
+            ext = "jpg"
+            if mime == "image/png":
+                ext = "png"
+            elif mime == "image/webp":
+                ext = "webp"
+            filename = f"{nome} - {key}.{ext}"
+
+            public_url = _drive_upload_image_and_get_public_url(
+                img_bytes,
+                filename,
+                folder_id,
+                mime_type=mime,
+                sa_info_override=sa_info_override,
+                cred_path_override=cred_path_override,
+            )
+            if public_url:
+                cache[key] = public_url
+                return f'=IMAGE("{public_url}")'
+
+        fallback_url = _photo_public_url_for_row(row, api_key_for_photo)
+        cache[key] = fallback_url or ""
+        return f'=IMAGE("{fallback_url}")' if fallback_url else ""
+    except Exception:
+        return ""
+
+
 def _digits_only(s: str) -> str:
     return "".join(ch for ch in (s or "") if ch.isdigit())
 
 
 
 def _gs_sort_by_segmento(ws, data_rows_count: int):
-    """
-    Ordena a aba por Segmento (coluna A) e depois por Empresa (coluna C),
-    mantendo o header na linha 1.
-    """
+    """Ordena a aba pela melhor coluna de segmento disponível, mantendo o header na linha 1."""
     try:
         if not data_rows_count or int(data_rows_count) <= 1:
             return
+
+        header = ws.row_values(1) or []
+        header_norm = [_gs_norm(x) for x in header]
+
+        sort_idx = 0
+        if "segmento_txt" in header_norm:
+            sort_idx = header_norm.index("segmento_txt")
+        elif "segmento" in header_norm:
+            sort_idx = header_norm.index("segmento")
+
+        end_col = max(len(header), len(_GS_EXPORT_HEADERS))
 
         ws.spreadsheet.batch_update(
             {
@@ -1045,22 +1579,18 @@ def _gs_sort_by_segmento(ws, data_rows_count: int):
                         "sortRange": {
                             "range": {
                                 "sheetId": ws.id,
-                                "startRowIndex": 1,  # pula header
+                                "startRowIndex": 1,
                                 "endRowIndex": 1 + int(data_rows_count),
                                 "startColumnIndex": 0,
-                                "endColumnIndex": 13,  # A..M
+                                "endColumnIndex": end_col,
                             },
-                            "sortSpecs": [
-                                {"dimensionIndex": 0, "sortOrder": "ASCENDING"},  # Coluna A
-                                {"dimensionIndex": 2, "sortOrder": "ASCENDING"},  # Coluna C
-                            ],
+                            "sortSpecs": [{"dimensionIndex": int(sort_idx), "sortOrder": "ASCENDING"}],
                         }
                     }
                 ]
             }
         )
     except Exception:
-        # Não bloqueia exportação se falhar
         return
 
 
@@ -1081,8 +1611,8 @@ def _gs_apply_contact_columns(ws, max_rows: int = 5000):
                 return header_norm.index(n) + 1
             return default_1based
 
-        col_checkbox = idx_of("Já fiz contato?", 6)  # F
-        col_date = idx_of("Data de contato", 7)      # G
+        col_checkbox = idx_of("Já fiz contato?", 9)
+        col_date = idx_of("Data de contato", 10)
 
         end_row = int(max_rows)
 
@@ -1131,164 +1661,10 @@ def _gs_apply_contact_columns(ws, max_rows: int = 5000):
     except Exception:
         return
 
-
-
-def _gs_apply_basic_filter(ws, max_rows: int = 5000):
-    """Ativa o filtro (Data -> Criar filtro) na linha de cabeçalho A1:M.
-
-    No Google Sheets API, o range do filtro precisa estar dentro do tamanho atual da planilha.
-    Por isso usamos ws.row_count/ws.col_count e fazemos resize mínimo para 13 colunas.
-    """
-    try:
-        # garante pelo menos 13 colunas (A..M)
-        try:
-            if int(getattr(ws, "col_count", 0) or 0) < 13:
-                ws.resize(cols=13)
-        except Exception:
-            pass
-
-        end_row = int(getattr(ws, "row_count", 0) or 0)
-        if end_row < 2:
-            end_row = 2  # header + 1 linha
-
-        # Limpa filtro existente, se houver
-        try:
-            ws.spreadsheet.batch_update({"requests": [{"clearBasicFilter": {"sheetId": ws.id}}]})
-        except Exception:
-            pass
-
-        ws.spreadsheet.batch_update({
-            "requests": [{
-                "setBasicFilter": {
-                    "filter": {
-                        "range": {
-                            "sheetId": ws.id,
-                            "startRowIndex": 0,
-                            "endRowIndex": end_row,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": 13
-                        }
-                    }
-                }
-            }]
-        })
-    except Exception:
-        return
-
-
 def _ensure_gsheet_headers(ws):
-    """
-    Headers alvo (A1:M1) — BASE ZERADA:
-    Segmento | Executiva Pixel | Empresa (Cliente) | Responsável Empresa | Telefone |
-    Já fiz contato? | Data de contato | Observações | E-mail | Endereço | Bairro | CEP | Atualizado em
-    """
-    expected = _GS_EXPORT_HEADERS
-    expected_norm = [_gs_norm(x) for x in expected]
-
-    # garante tamanho mínimo (A..M)
-    try:
-        if int(getattr(ws, 'col_count', 0) or 0) < 13:
-            ws.resize(cols=13)
-    except Exception:
-        pass
-
-
-    # lê A1:M1
-    cur = [ws.cell(1, c).value for c in range(1, 14)]
-    cur_norm = [_gs_norm(x) for x in cur]
-
-    # se diferente, padroniza
-    if cur_norm != expected_norm:
-        ws.update("A1:M1", [expected])
-
-
-def _gs_apply_row_rules(ws, max_rows: int = 5000):
-    """
-    Regras de formatação condicional (linha inteira A..M):
-    - Verde claro quando "Já fiz contato?" (coluna F) for TRUE
-    - Vermelho quando "Executiva Pixel" (coluna B) tiver valor diferente de "Vanessa" (e não vazio)
-
-    No Cloud, ranges fora do tamanho da planilha causam erro 400 e nada é aplicado.
-    Então usamos ws.row_count e garantimos 13 colunas.
-    """
-    try:
-        # garante pelo menos 13 colunas (A..M)
-        try:
-            if int(getattr(ws, "col_count", 0) or 0) < 13:
-                ws.resize(cols=13)
-        except Exception:
-            pass
-
-        end_row = int(getattr(ws, "row_count", 0) or 0)
-        if end_row < 2:
-            end_row = 2
-
-        # tenta buscar regras existentes (com fields explícitos)
-        existing_rules = []
-        try:
-            meta = ws.spreadsheet.fetch_sheet_metadata(params={"fields": "sheets(properties,conditionalFormats)"})
-            sheet = None
-            for s in (meta.get("sheets") or []):
-                props = (s.get("properties") or {})
-                if props.get("sheetId") == ws.id:
-                    sheet = s
-                    break
-            existing_rules = (sheet or {}).get("conditionalFormats") or []
-        except Exception:
-            existing_rules = []
-
-        # remove regras existentes (do fim pro começo)
-        if existing_rules:
-            reqs = []
-            for idx in range(len(existing_rules) - 1, -1, -1):
-                reqs.append({"deleteConditionalFormatRule": {"sheetId": ws.id, "index": idx}})
-            if reqs:
-                ws.spreadsheet.batch_update({"requests": reqs})
-
-        rng = {
-            "sheetId": ws.id,
-            "startRowIndex": 1,      # começa na linha 2 (0-based)
-            "endRowIndex": end_row,  # exclusivo
-            "startColumnIndex": 0,
-            "endColumnIndex": 13
-        }
-
-        green_rule = {
-            "addConditionalFormatRule": {
-                "index": 0,
-                "rule": {
-                    "ranges": [rng],
-                    "booleanRule": {
-                        "condition": {
-                            "type": "CUSTOM_FORMULA",
-                            "values": [{"userEnteredValue": "=$F2=TRUE"}]
-                        },
-                        "format": {"backgroundColor": {"red": 0.85, "green": 0.95, "blue": 0.85}}
-                    }
-                }
-            }
-        }
-
-        red_rule = {
-            "addConditionalFormatRule": {
-                "index": 1,
-                "rule": {
-                    "ranges": [rng],
-                    "booleanRule": {
-                        "condition": {
-                            "type": "CUSTOM_FORMULA",
-                            "values": [{"userEnteredValue": "=AND($B2<>\"\",$B2<>\"Vanessa\")"}]
-                        },
-                        "format": {"backgroundColor": {"red": 0.98, "green": 0.82, "blue": 0.82}}
-                    }
-                }
-            }
-        }
-
-        ws.spreadsheet.batch_update({"requests": [green_rule, red_rule]})
-    except Exception:
-        return
-
+    """Garante apenas o layout de C:R, sem alterar nada nas colunas A e B."""
+    expected_dynamic = _GS_DYNAMIC_HEADERS
+    ws.update("C1:R1", [expected_dynamic])
 
 def export_results_incremental_gsheet(
     df,
@@ -1299,10 +1675,17 @@ def export_results_incremental_gsheet(
     dedup: bool = True,
     sa_info_override: dict | None = None,
     cred_path_override: str | None = None,
+    google_api_key_for_photo: str = "",
 ):
     """
-    Exporta incrementalmente para Google Sheets na ordem exata:
-    Segmento | Cliente | Responsável | Contato | Já fiz contato? | Data de contato | E-mail | Endereço | Bairro | CEP | Atualizado em | Executiva
+    Exporta incrementalmente para Google Sheets no layout:
+    ID_CLIENTE | Segmento | Segmento_TXT | Executiva Pixel | Empresa (Cliente) |
+    Responsável pela Empresa | Telefone | E-mail | Já fiz contato? | Data de contato |
+    Observações | Site | Endereço | Bairro | CEP | Atualizado em | Foto | Foto_AppSheet
+
+    As colunas A/B não são alteradas.
+    A exportação escreve somente de C a R.
+    A coluna R recebe apenas a URL direta da imagem (Foto_AppSheet).
     """
     gc = _get_gspread_client(sa_info_override=sa_info_override, cred_path_override=cred_path_override)
 
@@ -1315,8 +1698,6 @@ def export_results_incremental_gsheet(
 
     _ensure_gsheet_headers(ws)
     _gs_apply_contact_columns(ws)
-    _gs_apply_basic_filter(ws)
-    _gs_apply_row_rules(ws)
 
     if updated_dt is None:
         if ZoneInfo is not None:
@@ -1325,62 +1706,115 @@ def export_results_incremental_gsheet(
             updated_dt = datetime.now()
     updated_str = updated_dt.strftime("%d/%m/%Y %H:%M:%S")
 
-    # lê A2:L (dados)
-    existing_rows = ws.get("A2:M") or []
+    google_api_key_for_photo = (google_api_key_for_photo or os.getenv("GOOGLE_API_KEY", "") or _safe_secrets_get("GOOGLE_API_KEY", "") or "").strip()
+
+    existing_rows = ws.get("A2:R") or []
 
     existing = set()
+    existing_row_map = {}
     if dedup:
-        for r in existing_rows:
-            cliente0 = (r[2] if len(r) > 2 else "").strip()
-            contato0 = (r[4] if len(r) > 4 else "").strip()
-            email0 = (r[8] if len(r) > 8 else "").strip()
-            endereco0 = (r[9] if len(r) > 9 else "").strip()
+        for idx, r in enumerate(existing_rows, start=2):
+            cliente0 = (r[4] if len(r) > 4 else "").strip()
+            contato0 = (r[6] if len(r) > 6 else "").strip()
+            email0 = (r[7] if len(r) > 7 else "").strip()
+            endereco0 = (r[12] if len(r) > 12 else "").strip()
+            foto0 = (r[16] if len(r) > 16 else "").strip()
+            foto_app0 = (r[17] if len(r) > 17 else "").strip()
             key = _dedup_key(cliente0, contato0, email0, endereco0)
             if key != ("", ""):
                 existing.add(key)
+                if key not in existing_row_map:
+                    existing_row_map[key] = {
+                        "row_number": idx,
+                        "foto": foto0,
+                        "foto_appsheet": foto_app0,
+                    }
 
     rows_to_append = []
     skipped = 0
+    cells_to_update = []
 
     for _, row in df.iterrows():
-        segmento = str(_pick_row_value(row, ["Categoria", "Segmento"])).strip()
-        cliente = str(_pick_row_value(row, ["Nome", "Cliente", "Estabelecimento", "Nome do estabelecimento"])).strip()
-
-        # contato e email
-        contato = _get_primary_phone_ddd(row)
-        email = _get_email_or_site(row)
-
+        segmento_txt = str(_pick_row_value(row, ["Categoria", "Segmento", "Segmento_TXT"])).strip()
+        cliente = str(_pick_row_value(row, ["Nome", "Cliente", "Estabelecimento", "Nome do estabelecimento", "Empresa (Cliente)"])).strip()
+        telefone = _get_primary_phone_ddd(row)
+        email = _get_email_row(row)
+        site = _get_site_row(row)
         endereco, bairro, _cidade, cep = _get_endereco_fields(row)
-
+        foto_cell = _photo_cell_formula_for_row(
+            row,
+            api_key_for_photo=google_api_key_for_photo,
+            sa_info_override=sa_info_override,
+            cred_path_override=cred_path_override,
+        )
+        foto_appsheet = _photo_public_url_for_row(
+            row,
+            api_key_for_photo=google_api_key_for_photo,
+        )
         responsavel = _get_responsavel_row(row)
 
-        key = _dedup_key(cliente, contato, email, endereco)
+        key = _dedup_key(cliente, telefone, email, endereco)
         if dedup and key in existing and key != ("", ""):
+            existing_info = existing_row_map.get(key) or {}
+            row_number = existing_info.get("row_number")
+            foto_atual = (existing_info.get("foto") or "").strip()
+            foto_app_atual = (existing_info.get("foto_appsheet") or "").strip()
+
+            if row_number:
+                if foto_cell and not foto_atual:
+                    cells_to_update.append({"range": f"Q{row_number}", "values": [[foto_cell]]})
+                    existing_info["foto"] = foto_cell
+                if foto_appsheet and not foto_app_atual:
+                    cells_to_update.append({"range": f"R{row_number}", "values": [[foto_appsheet]]})
+                    existing_info["foto_appsheet"] = foto_appsheet
+
             skipped += 1
             continue
 
-        rows_to_append.append([segmento, executiva, cliente, responsavel, contato, False, "", "", email, endereco, bairro, cep, updated_str])
+        rows_to_append.append([
+            segmento_txt,
+            executiva,
+            cliente,
+            responsavel,
+            telefone,
+            email,
+            False,
+            "",
+            "",
+            site,
+            endereco,
+            bairro,
+            cep,
+            updated_str,
+            foto_cell,
+            foto_appsheet,
+        ])
         if dedup and key != ("", ""):
             existing.add(key)
 
     if rows_to_append:
-        ws.append_rows(rows_to_append, value_input_option="RAW")
-        # ordena por Segmento (mantém header)
+        ws.append_rows(rows_to_append, value_input_option="USER_ENTERED", table_range="C:R")
         _gs_sort_by_segmento(ws, data_rows_count=(len(existing_rows) + len(rows_to_append)))
 
-    return {"added": len(rows_to_append), "skipped": skipped, "spreadsheet_id": spreadsheet_id, "worksheet": worksheet_name}
+    if cells_to_update:
+        ws.batch_update(cells_to_update, value_input_option="USER_ENTERED")
 
-@st.cache_data(ttl=3600, show_spinner=False)
+    return {
+        "added": len(rows_to_append),
+        "updated_photo_cells": len(cells_to_update),
+        "skipped": skipped,
+        "spreadsheet_id": spreadsheet_id,
+        "worksheet": worksheet_name,
+    }
+
 def nominatim_suggest(query: str, limit: int = 6) -> list[dict]:
     """
-    Busca sugestões no Nominatim (OSM) para autocomplete.
-    Cloud-safe: não quebra em 403/429 (rate-limit) e usa User-Agent completo.
-    Retorna lista de dicts (jsonv2).
+    Busca sugestões no Nominatim (OSM).
+    Retorna uma lista de dicts com display_name + address details.
     """
     q = (query or "").strip()
     if len(q) < 4:
         return []
-
     url = "https://nominatim.openstreetmap.org/search"
     params = {
         "format": "jsonv2",
@@ -1389,93 +1823,33 @@ def nominatim_suggest(query: str, limit: int = 6) -> list[dict]:
         "limit": int(limit),
         "countrycodes": "br",
     }
-    headers = {
-        "User-Agent": "InfoComerciais/1.0 (streamlit; contact: vanessa@pixelretail.com.br)",
-        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-    }
-
+    headers = {"User-Agent": "SuplemexApp/1.0 (streamlit)"}
     try:
         r = requests.get(url, params=params, headers=headers, timeout=15)
-        # 429/403 acontecem no Cloud (IP compartilhado). Não quebrar: apenas retornar vazio.
-        if r.status_code >= 400:
-            return []
+        r.raise_for_status()
         data = r.json()
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            return []
+        return data
     except Exception:
         return []
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def photon_suggest(query: str, limit: int = 6) -> list[dict]:
-    """
-    Fallback de sugestões via Photon (Komoot).
-    Retorna uma lista de dicts no formato do Photon (features).
-    """
-    q = (query or "").strip()
-    if len(q) < 4:
-        return []
-    url = "https://photon.komoot.io/api/"
-    params = {
-        "q": q,
-        "limit": int(limit),
-        "lang": "pt",
-        "osm_tag": "place",   # ajuda a reduzir lixo
-    }
-    headers = {
-        "User-Agent": "InfoComerciais/1.0 (streamlit; contact: vanessa@pixelretail.com.br)",
-        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-    }
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=15)
-        if r.status_code >= 400:
-            return []
-        data = r.json()
-        feats = (data or {}).get("features") or []
-        return feats if isinstance(feats, list) else []
-    except Exception:
-        return []
-
 
 def _uf_allowed_for_result(res: dict) -> bool:
-    """
-    Filtra resultados para estados permitidos.
-    ALLOWED_UF deve ser um dict UF->Nome do estado (ex.: {"RJ":"Rio de Janeiro"}).
-    Se ALLOWED_UF estiver vazio, aceita tudo.
-    """
     if not ALLOWED_UF:
         return True
     try:
+        addr = res.get("address") or {}
+        state = (addr.get("state") or "").strip()
+        # aceita se o estado bater com algum permitido
         allowed_states = set((v or "").strip().lower() for v in ALLOWED_UF.values())
-
-        # Nominatim: {"address":{"state":...}}
-        addr = res.get("address") if isinstance(res.get("address"), dict) else {}
-        state = (addr.get("state") or "").strip().lower()
-
-        # Photon: {"properties":{"state":...}}
-        if not state:
-            props = res.get("properties") if isinstance(res.get("properties"), dict) else {}
-            state = (props.get("state") or "").strip().lower()
-
-        if not state:
-            return False
-
-        return (state in allowed_states) or any(a in state for a in allowed_states)
+        return (state.lower() in allowed_states) or any(a in state.lower() for a in allowed_states)
     except Exception:
         return False
 
-
 def get_suggestions_filtered(query: str, limit: int = 6) -> list[str]:
-    """
-    Retorna sugestões (strings) já filtradas por UF/estado.
-    Estratégia:
-      1) Nominatim
-      2) Photon fallback (caso Nominatim esteja rate-limited)
-    """
+    raw = nominatim_suggest(query, limit=limit)
     out: list[str] = []
-
-    # 1) Nominatim
-    raw1 = nominatim_suggest(query, limit=limit)
-    for r in raw1:
+    for r in raw:
         if not isinstance(r, dict):
             continue
         if not _uf_allowed_for_result(r):
@@ -1483,40 +1857,9 @@ def get_suggestions_filtered(query: str, limit: int = 6) -> list[str]:
         dn = (r.get("display_name") or "").strip()
         if dn:
             out.append(dn)
-
-    # 2) Photon (fallback)
-    if not out:
-        raw2 = photon_suggest(query, limit=limit)
-        for f in raw2:
-            if not isinstance(f, dict):
-                continue
-            if not _uf_allowed_for_result(f):
-                continue
-            props = f.get("properties") if isinstance(f.get("properties"), dict) else {}
-            name = (props.get("name") or "").strip()
-            street = (props.get("street") or "").strip()
-            housenumber = (props.get("housenumber") or "").strip()
-            city = (props.get("city") or props.get("town") or props.get("village") or "").strip()
-            state = (props.get("state") or "").strip()
-            postcode = (props.get("postcode") or "").strip()
-            parts = []
-            if street:
-                parts.append(f"{street}{', ' + housenumber if housenumber else ''}")
-            elif name:
-                parts.append(name)
-            if city:
-                parts.append(city)
-            if state:
-                parts.append(state)
-            if postcode:
-                parts.append(postcode)
-            dn = ", ".join([p for p in parts if p])
-            if dn:
-                out.append(dn)
-
     # remove duplicados preservando ordem
     seen = set()
-    uniq: list[str] = []
+    uniq = []
     for s in out:
         k = s.lower()
         if k in seen:
@@ -1624,29 +1967,17 @@ def main():
     # ===============================
     CATEGORIES_CONFIG = {
         "🛒 Mercados": {"google_type": "supermarket", "osm": ["shop=supermarket", "shop=convenience", "shop=grocery"]},
-        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual", "municipal", "ciep", "CIEP"]},
+        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual"]},
         "🏫 Faculdades/Universidades": {"google_type": "school", "osm": ["amenity=university"]},
-        "✈️ Agências de Viagens": {
-            "google_type": ["travel_agency", "tourist_information"],
-            "osm": ["shop=travel_agency", "office=travel_agent", "tourism=information"],
-            "google_keywords": [
-                "Agência de Viagens", "Agencia de Viagens", "Turismo", "Viagens",
-                "Pacotes", "Pacotes de viagem", "Passagens", "Passagens aéreas",
-                "Passagens aereas", "Cruzeiro", "Cruzeiros", "Intercâmbio", "Intercambio",
-                "Operadora de turismo", "Operadora", "Excursão", "Excursao"
-            ],
-            "segment_name_any": [
-                "agência de viagens", "agencia de viagens", "turismo", "viagens",
-                "passagens", "passagem", "pacote", "pacotes", "cruzeiro", "intercâmbio", "intercambio",
-                "operadora", "excursão", "excursao"
-            ],
-            "name_exclude": ["hotel", "pousada", "hostel", "motel", "hospedagem"]
-        },
+        # "🏗️ Construtoras": {"google_type": "general_contractor", "osm": ["office=construction", "craft=builder", "office=architect"]},
         "🏥 Hospitais": {"google_type": "hospital", "osm": ["amenity=hospital", "amenity=clinic", "amenity=doctors"]},
         "💊 Farmácias": {"google_type": "pharmacy", "osm": ["amenity=pharmacy"]},
         "🚗 Automotivos": {"google_type": "car_dealer", "osm": ["amenity=car_dealer", "shop=car", "amenity=car_repair", "shop=car_repair"]},
         "🍽️ Restaurantes": {"google_type": "restaurant", "osm": ["amenity=restaurant", "amenity=cafe", "amenity=fast_food"]},
+        "🏦 Bancos": {"google_type": "bank", "osm": ["amenity=bank", "amenity=atm"]},
+        "⛽ Postos": {"google_type": "gas_station", "osm": ["amenity=fuel"]},
         "💪 Academias": {"google_type": "gym", "osm": ["leisure=fitness_centre", "leisure=sports_centre"]},
+        "🏬 Shoppings": {"google_type": "shopping_mall", "osm": ["shop=mall"]},
         "🚘 Concessionárias": {
             "google_type": "car_dealer",
             "osm": ["amenity=car_dealer", "shop=car"],
@@ -1654,7 +1985,7 @@ def main():
             "name_must_contain": ["jeep", "fiat", "ford", "volkswagen", "vw", "chevrolet", "hyundai", "nissan", "renault", "honda", "toyota","mitsubishi", "kia", "peugeot", "citroën", "suzuki", "jac", "byd", "chery", "lifan"],
             "name_exclude": ["hotel", "pousada", "hostel", "hospedagem", "motel"]
         },
-        "🏗️ Construtoras / Incorporadoras": {
+        "🏗️ Construtoras (MRV etc)": {
             "google_type": ["general_contractor", "real_estate_agency"],
             "osm": ["office=construction", "craft=builder", "office=architect"],
             "google_keywords": ["Stand de vendas", "Estande de vendas", "Plantão de vendas", "Plantao de vendas", "Stand imobiliário", "Estande imobiliário", "Estande imobiliario", "Stand", "Estande", "Gafisa", "Mozak", "Mozak Rio", "LatinExclusive", "Latin Exclusive", "Incorporadora Gafisa", "Incorporadora Mozak", "Incorporadora Latin Exclusive", "Construtora MRV", "Construtora Direcional", "Construtora Tenda", "Construtora Cury", "Construtora Cyrela", "Construtora Even", "Construtora Gafisa","Construtora Rossi", "Construtora Trisul", "Construtora Eztec", "Construtora Tecnisa", "Construtora Brookfield", "Construtora Plaenge", "Construtora Mitre", "Construtora Viver", "Construtora Rodobens", "Construtora Patrimar", "Incorporadora", "Incorporação imobiliária", "Incorporadora MRV", "Incorporadora Direcional", "Incorporadora Tenda", "Incorporadora Cury", "Incorporadora Cyrela", "Incorporadora Even", "Incorporadora Gafisa", "Incorporadora Mitre", "Incorporadora Eztec"],
@@ -1668,15 +1999,17 @@ def main():
         "🛒 Mercados": "blue",
         "🏫 Escolas": "green",
         "🏫 Faculdades/Universidades": "green",
-       "✈️ Agências de Viagens" : "cyan",
+        "🏗️ Construtoras": "orange",
         "🏥 Hospitais": "red",
         "💊 Farmácias": "purple",
         "🚗 Automotivos":"darkcyan",
         "🍽️ Restaurantes": "darkred",
+        "🏦 Bancos": "darkblue",
+        "⛽ Postos": "gray",
         "💪 Academias": "darkgreen",
         "🏬 Shoppings": "cadetblue",
         "🚘 Concessionárias": "lightblue",
-        "🏗️ Construtoras / Incorporadoras": "orange",
+        "🏗️ Construtoras (MRV etc)": "orange",
     }
 
     def _filter_rows_by_cfg(rows, cfg):
@@ -1691,7 +2024,7 @@ def main():
         must = [str(x).strip().lower() for x in (cfg.get("name_must_contain") or []) if str(x).strip()]
         must_extra = [str(x).strip().lower() for x in (cfg.get("name_must_contain_extra_any") or []) if str(x).strip()]
         excl = [str(x).strip().lower() for x in (cfg.get("name_exclude") or []) if str(x).strip()]
-        seg_terms = [str(x).strip().lower() for x in (cfg.get("segment_name_any") or []) if str(x).strip()]
+        seg_any = [str(x).strip().lower() for x in (cfg.get("segment_name_any") or []) if str(x).strip()]
         conditional_requires = cfg.get("conditional_requires") or []
         if not must and not must_extra and not excl:
             return rows
@@ -1702,7 +2035,7 @@ def main():
 
             if must and not any(t in nm for t in must):
                 # fallback genérico do segmento (ex.: 'stand de vendas' em Construtoras)
-                if not (seg_terms and any(t in nm for t in seg_terms)):
+                if not (seg_any and any(t in nm for t in seg_any)):
                     continue
             if must_extra and not any(t in nm for t in must_extra):
                 continue
@@ -2626,18 +2959,6 @@ def main():
             else:
                 df = pd.DataFrame(all_rows)
 
-                # Filtro por palavra-chave (local): garante que funciona também no OSM e após o filtro de categoria
-                if keyword:
-                    kw = str(keyword).strip().lower()
-                    if kw:
-                        def _row_match_kw(r):
-                            try:
-                                return (kw in str(r.get("Nome","")).lower()) or (kw in str(r.get("Endereço","")).lower())
-                            except Exception:
-                                return False
-                        df = df[df.apply(_row_match_kw, axis=1)].copy()
-
-
                 df["Distância (km)"] = df.apply(lambda r: haversine_km(lat, lon, r["Latitude"], r["Longitude"]), axis=1).astype(float).round(2)
 
                 # GARANTIA: filtra por raio (evita itens fora do limite)
@@ -2763,6 +3084,7 @@ def main():
                         executiva="Vanessa",
                         updated_dt=dt,
                         dedup=dedup,
+                        google_api_key_for_photo=api_key,
                     )
 
                     out_name = template_name.replace(".xlsx", "")
@@ -2816,7 +3138,7 @@ def main():
 
             st.caption(
                 "A exportação é **incremental**: o app adiciona os novos registros no final da aba. "
-                "Campos: Segmento | Executiva | Endereço origem | Cliente | Endereço | Responsável | Contato | Atualizado em."
+                "Campos a partir da coluna C: Segmento_TXT | Executiva Pixel | Empresa (Cliente) | Responsável pela Empresa | Telefone | E-mail | Já fiz contato? | Data de contato | Observações | Site | Endereço | Bairro | CEP | Atualizado em | Foto | Foto_AppSheet. As colunas A e B não são alteradas, e a coluna R recebe apenas a URL da imagem."
             )
 
             # Planilha fixa (não precisa preencher nada)
@@ -2874,6 +3196,7 @@ def main():
                         dedup=dedup_gs,
                         sa_info_override=sa_info_override,
                         cred_path_override=cred_path_override,
+                        google_api_key_for_photo=api_key,
                     )
 
                     st.success(
