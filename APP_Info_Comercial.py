@@ -1846,17 +1846,56 @@ def _uf_allowed_for_result(res: dict) -> bool:
     except Exception:
         return False
 
-def get_suggestions_filtered(query: str, limit: int = 6) -> list[str]:
-    raw = nominatim_suggest(query, limit=limit)
+def google_autocomplete_suggest(query: str, api_key: str, limit: int = 6) -> list[str]:
+    """
+    Busca sugestões de endereço via Google Places Autocomplete.
+    Usa a mesma família de APIs já utilizada no app para Nearby/Details.
+    """
+    q = (query or "").strip()
+    if len(q) < 4 or not api_key:
+        return []
+    url = "https://maps.googleapis.com/maps/api/place/autocomplete/json"
+    params = {
+        "input": q,
+        "language": "pt-BR",
+        "components": "country:br",
+        "types": "address",
+        "key": api_key,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json() or {}
+        preds = data.get("predictions") or []
+        out = []
+        for item in preds[: max(1, int(limit))]:
+            desc = str(item.get("description") or "").strip()
+            if desc:
+                out.append(desc)
+        return out
+    except Exception:
+        return []
+
+
+def get_suggestions_filtered(query: str, limit: int = 6, api_key: str = "") -> list[str]:
     out: list[str] = []
-    for r in raw:
-        if not isinstance(r, dict):
-            continue
-        if not _uf_allowed_for_result(r):
-            continue
-        dn = (r.get("display_name") or "").strip()
-        if dn:
-            out.append(dn)
+
+    # 1) Tenta Google Autocomplete primeiro (mais estável no Cloud e coerente com o restante do app)
+    google_sugs = google_autocomplete_suggest(query, api_key=api_key, limit=limit)
+    out.extend(google_sugs)
+
+    # 2) Fallback Nominatim/OSM
+    if len(out) < limit:
+        raw = nominatim_suggest(query, limit=limit)
+        for r in raw:
+            if not isinstance(r, dict):
+                continue
+            if not _uf_allowed_for_result(r):
+                continue
+            dn = (r.get("display_name") or "").strip()
+            if dn:
+                out.append(dn)
+
     # remove duplicados preservando ordem
     seen = set()
     uniq = []
@@ -1866,7 +1905,7 @@ def get_suggestions_filtered(query: str, limit: int = 6) -> list[str]:
             continue
         seen.add(k)
         uniq.append(s)
-    return uniq
+    return uniq[: max(1, int(limit))]
 
 def _highlight_match(texto: str, termo: str) -> str:
     """Destaca o termo digitado em negrito (HTML), mantendo segurança."""
@@ -2079,8 +2118,8 @@ def main():
         st.session_state.addr_suggestions = []
     if "addr_last_query" not in st.session_state:
         st.session_state.addr_last_query = ""
-    if "trigger_search" not in st.session_state:
-        st.session_state.trigger_search = False
+    if "trigger_suggest" not in st.session_state:
+        st.session_state.trigger_suggest = False
     if "addr_input_pending" not in st.session_state:
         st.session_state.addr_input_pending = ""
 
@@ -2098,7 +2137,7 @@ def main():
         st.session_state.addr_hist_sel = "(digitar novo)"
         st.session_state.addr_suggestions = []
         st.session_state.addr_last_query = ""
-        st.session_state.trigger_search = False
+        st.session_state.trigger_suggest = False
         st.session_state.addr_input_pending = ""
 
     def _on_hist_change():
@@ -2111,8 +2150,8 @@ def main():
         sel = (st.session_state.get("addr_hist_sel") or "(digitar novo)").strip()
         if sel != "(digitar novo)" and typed != sel:
             st.session_state["addr_hist_sel"] = "(digitar novo)"
-        # Permite pressionar ENTER no campo para disparar a busca
-        st.session_state.trigger_search = bool(typed)
+        # ENTER/blur no campo agora apenas atualiza as sugestões; a busca fica explícita no botão Buscar
+        st.session_state.trigger_suggest = bool(typed)
 
     # ===============================
     # UTILS
@@ -2827,18 +2866,35 @@ def main():
             on_change=_on_hist_change,
         )
 
-        # Campo principal (bonito e estável)
-        st.text_input(
-            "📍 Endereço",
-            key="addr_input",
-            placeholder="Digite (rua, número, bairro, cidade)...",
-            on_change=_on_addr_change,
-        )
+        # Campo principal + botão explícito para atualizar sugestões
+        addr_col, sug_col = st.columns([0.74, 0.26], gap="small")
+        with addr_col:
+            st.text_input(
+                "📍 Endereço",
+                key="addr_input",
+                placeholder="Digite (rua, número, bairro, cidade)...",
+                on_change=_on_addr_change,
+            )
+        with sug_col:
+            st.write("")
+            st.write("")
+            suggest_now = st.button("📌 Sugerir", use_container_width=True)
 
-        # Sugestões estilo Google (aparecem enquanto digita) — estável e bonito
+        # Sugestões estilo Google
+        # Observação: no Streamlit o valor do text_input só é consolidado ao confirmar/blur.
+        # Então o botão Sugerir torna o fluxo estável tanto local quanto no Cloud.
         _q = (st.session_state.get("addr_input") or "").strip()
+        _prev_q = (st.session_state.get("addr_last_query") or "").strip()
+        _need_refresh_sugs = bool(st.session_state.pop("trigger_suggest", False)) or suggest_now or ((_q != _prev_q) and len(_q) >= 4)
+
+        if len(_q) < 4:
+            _sugs = []
+        elif _need_refresh_sugs or not st.session_state.get("addr_suggestions"):
+            _sugs = get_suggestions_filtered(_q, limit=6, api_key=api_key)
+        else:
+            _sugs = st.session_state.get("addr_suggestions") or []
+
         st.session_state["addr_last_query"] = _q
-        _sugs = get_suggestions_filtered(_q, limit=6) if len(_q) >= 4 else []
         st.session_state["addr_suggestions"] = _sugs
 
         # CSS (visual “Google-like”)
@@ -2907,7 +2963,7 @@ def main():
                         unsafe_allow_html=True,
                     )
 
-            st.caption("Dica: ao clicar em Buscar, se houver sugestões, a 1ª é usada automaticamente.")
+            st.caption("Dica: clique em 📌 Sugerir para carregar opções; ao clicar em Buscar, a 1ª sugestão é usada automaticamente.")
 
         radius = st.slider("📏 Raio (km)", 0.5, 10.0, 3.0, 0.5)
 
@@ -2927,7 +2983,7 @@ def main():
 
         debug = st.checkbox("🧪 Debug (ver status/erros)", value=False)
 
-        go = st.button("🚀 Buscar", type="primary", use_container_width=True) or bool(st.session_state.pop("trigger_search", False))
+        go = st.button("🚀 Buscar", type="primary", use_container_width=True)
 
         st.button("🧹 Limpar", use_container_width=True, on_click=clear_all)
 
@@ -3317,7 +3373,7 @@ def _run_streamlit_from_python():
     print(f"🔗 URL: http://127.0.0.1:{port}")
     print("=" * 60)
     # Bloqueia no processo do Streamlit (CTRL+C para parar)
-    # subprocess.run(args)
+    subprocess.run(args)
 
 
 if __name__ == "__main__":
