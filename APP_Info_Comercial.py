@@ -2081,6 +2081,13 @@ def main():
         st.session_state.addr_last_query = ""
     if "trigger_search" not in st.session_state:
         st.session_state.trigger_search = False
+    if "addr_input_pending" not in st.session_state:
+        st.session_state.addr_input_pending = ""
+
+    _pending_addr = (st.session_state.get("addr_input_pending") or "").strip()
+    if _pending_addr:
+        st.session_state.addr_input = _pending_addr
+        st.session_state.addr_input_pending = ""
 
     def clear_all():
         st.session_state.results_df = None
@@ -2092,6 +2099,7 @@ def main():
         st.session_state.addr_suggestions = []
         st.session_state.addr_last_query = ""
         st.session_state.trigger_search = False
+        st.session_state.addr_input_pending = ""
 
     def _on_hist_change():
         sel = (st.session_state.get("addr_hist_sel") or "(digitar novo)").strip()
@@ -2946,7 +2954,7 @@ def main():
 
         if _addr_raw and _sugs_now and (_addr_raw == _last_q) and (_addr_raw != _sugs_now[0]):
             addr = _sugs_now[0]
-            st.session_state["addr_input"] = addr  # auto-preenche visualmente
+            st.session_state["addr_input_pending"] = addr  # aplica no próximo rerun, antes do widget
         else:
             addr = _addr_raw
 
