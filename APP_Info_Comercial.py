@@ -2119,17 +2119,29 @@ def main():
     # ===============================
     CATEGORIES_CONFIG = {
         "🛒 Mercados": {"google_type": "supermarket", "osm": ["shop=supermarket", "shop=convenience", "shop=grocery"]},
-        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual"]},
+        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual", "municipal", "ciep", "CIEP"]},
         "🏫 Faculdades/Universidades": {"google_type": "school", "osm": ["amenity=university"]},
-        # "🏗️ Construtoras": {"google_type": "general_contractor", "osm": ["office=construction", "craft=builder", "office=architect"]},
+        "✈️ Agências de Viagens": {
+            "google_type": ["travel_agency", "tourist_information"],
+            "osm": ["shop=travel_agency", "office=travel_agent", "tourism=information"],
+            "google_keywords": [
+                "Agência de Viagens", "Agencia de Viagens", "Turismo", "Viagens",
+                "Pacotes", "Pacotes de viagem", "Passagens", "Passagens aéreas",
+                "Passagens aereas", "Cruzeiro", "Cruzeiros", "Intercâmbio", "Intercambio",
+                "Operadora de turismo", "Operadora", "Excursão", "Excursao"
+            ],
+            "segment_name_any": [
+                "agência de viagens", "agencia de viagens", "turismo", "viagens",
+                "passagens", "passagem", "pacote", "pacotes", "cruzeiro", "intercâmbio", "intercambio",
+                "operadora", "excursão", "excursao"
+            ],
+            "name_exclude": ["hotel", "pousada", "hostel", "motel", "hospedagem"]
+        },
         "🏥 Hospitais": {"google_type": "hospital", "osm": ["amenity=hospital", "amenity=clinic", "amenity=doctors"]},
         "💊 Farmácias": {"google_type": "pharmacy", "osm": ["amenity=pharmacy"]},
         "🚗 Automotivos": {"google_type": "car_dealer", "osm": ["amenity=car_dealer", "shop=car", "amenity=car_repair", "shop=car_repair"]},
         "🍽️ Restaurantes": {"google_type": "restaurant", "osm": ["amenity=restaurant", "amenity=cafe", "amenity=fast_food"]},
-        "🏦 Bancos": {"google_type": "bank", "osm": ["amenity=bank", "amenity=atm"]},
-        "⛽ Postos": {"google_type": "gas_station", "osm": ["amenity=fuel"]},
         "💪 Academias": {"google_type": "gym", "osm": ["leisure=fitness_centre", "leisure=sports_centre"]},
-        "🏬 Shoppings": {"google_type": "shopping_mall", "osm": ["shop=mall"]},
         "🚘 Concessionárias": {
             "google_type": "car_dealer",
             "osm": ["amenity=car_dealer", "shop=car"],
@@ -2137,7 +2149,7 @@ def main():
             "name_must_contain": ["jeep", "fiat", "ford", "volkswagen", "vw", "chevrolet", "hyundai", "nissan", "renault", "honda", "toyota","mitsubishi", "kia", "peugeot", "citroën", "suzuki", "jac", "byd", "chery", "lifan"],
             "name_exclude": ["hotel", "pousada", "hostel", "hospedagem", "motel"]
         },
-        "🏗️ Construtoras (MRV etc)": {
+        "🏗️ Construtoras / Incorporadoras": {
             "google_type": ["general_contractor", "real_estate_agency"],
             "osm": ["office=construction", "craft=builder", "office=architect"],
             "google_keywords": ["Stand de vendas", "Estande de vendas", "Plantão de vendas", "Plantao de vendas", "Stand imobiliário", "Estande imobiliário", "Estande imobiliario", "Stand", "Estande", "Gafisa", "Mozak", "Mozak Rio", "LatinExclusive", "Latin Exclusive", "Incorporadora Gafisa", "Incorporadora Mozak", "Incorporadora Latin Exclusive", "Construtora MRV", "Construtora Direcional", "Construtora Tenda", "Construtora Cury", "Construtora Cyrela", "Construtora Even", "Construtora Gafisa","Construtora Rossi", "Construtora Trisul", "Construtora Eztec", "Construtora Tecnisa", "Construtora Brookfield", "Construtora Plaenge", "Construtora Mitre", "Construtora Viver", "Construtora Rodobens", "Construtora Patrimar", "Incorporadora", "Incorporação imobiliária", "Incorporadora MRV", "Incorporadora Direcional", "Incorporadora Tenda", "Incorporadora Cury", "Incorporadora Cyrela", "Incorporadora Even", "Incorporadora Gafisa", "Incorporadora Mitre", "Incorporadora Eztec"],
@@ -2151,17 +2163,15 @@ def main():
         "🛒 Mercados": "blue",
         "🏫 Escolas": "green",
         "🏫 Faculdades/Universidades": "green",
-        "🏗️ Construtoras": "orange",
+       "✈️ Agências de Viagens" : "cyan",
         "🏥 Hospitais": "red",
         "💊 Farmácias": "purple",
         "🚗 Automotivos":"darkcyan",
         "🍽️ Restaurantes": "darkred",
-        "🏦 Bancos": "darkblue",
-        "⛽ Postos": "gray",
         "💪 Academias": "darkgreen",
         "🏬 Shoppings": "cadetblue",
         "🚘 Concessionárias": "lightblue",
-        "🏗️ Construtoras (MRV etc)": "orange",
+        "🏗️ Construtoras / Incorporadoras": "orange",
     }
 
     def _filter_rows_by_cfg(rows, cfg):
@@ -3083,7 +3093,7 @@ def main():
         categories = st.multiselect(
             "🏷️ Categorias",
             options=list(CATEGORIES_CONFIG.keys()),
-            default=["🏫 Escolas", "💊 Farmácias", "🍽️ Restaurantes"]
+            default=["🏫 Escolas", "🏫 Faculdades/Universidades", "✈️ Agências de Viagens", "🏥 Hospitais", "💪 Academias", "🚘 Concessionárias", "🏗️ Construtoras / Incorporadoras"]
         )
 
         keyword = st.text_input("🔎 Palavra-chave (opcional)", value="", placeholder="Ex: Zaccaria, 24h, delivery...")
