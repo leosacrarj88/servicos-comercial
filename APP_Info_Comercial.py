@@ -1676,6 +1676,7 @@ def export_results_incremental_gsheet(
     sa_info_override: dict | None = None,
     cred_path_override: str | None = None,
     google_api_key_for_photo: str = "",
+    progress_callback=None,
 ):
     """
     Exporta incrementalmente para Google Sheets no layout:
@@ -1687,6 +1688,32 @@ def export_results_incremental_gsheet(
     A exportação escreve somente de C a R.
     A coluna R recebe apenas a URL direta da imagem (Foto_AppSheet).
     """
+
+    def _emit_progress(percent: float, message: str, current: int = 0, total: int = 0, item: str = "", added: int = 0, skipped_count: int = 0, updated_count: int = 0, phase: str = ""):
+        if callable(progress_callback):
+            try:
+                progress_callback({
+                    "percent": max(0.0, min(100.0, float(percent))),
+                    "message": message,
+                    "current": int(current or 0),
+                    "total": int(total or 0),
+                    "item": item or "",
+                    "added": int(added or 0),
+                    "skipped": int(skipped_count or 0),
+                    "updated": int(updated_count or 0),
+                    "phase": phase or "",
+                })
+            except Exception:
+                pass
+
+    def _chunk_list(seq, size: int):
+        size = max(1, int(size or 1))
+        for i in range(0, len(seq), size):
+            yield seq[i:i + size]
+
+    total_rows = int(len(df.index)) if df is not None else 0
+    _emit_progress(1, "Inicializando exportação para Google Planilhas...", current=0, total=total_rows, phase="init")
+
     gc = _get_gspread_client(sa_info_override=sa_info_override, cred_path_override=cred_path_override)
 
     spreadsheet_id = _extract_sheet_id(spreadsheet_url_or_id or DEFAULT_GSHEET_ID)
@@ -1696,6 +1723,7 @@ def export_results_incremental_gsheet(
     sh = gc.open_by_key(spreadsheet_id)
     ws = sh.worksheet(worksheet_name)
 
+    _emit_progress(4, "Validando cabeçalho e colunas da planilha...", current=0, total=total_rows, phase="setup")
     _ensure_gsheet_headers(ws)
     _gs_apply_contact_columns(ws)
 
@@ -1708,6 +1736,7 @@ def export_results_incremental_gsheet(
 
     google_api_key_for_photo = (google_api_key_for_photo or os.getenv("GOOGLE_API_KEY", "") or _safe_secrets_get("GOOGLE_API_KEY", "") or "").strip()
 
+    _emit_progress(8, "Lendo registros já existentes na planilha...", current=0, total=total_rows, phase="read_existing")
     existing_rows = ws.get("A2:R") or []
 
     existing = set()
@@ -1733,8 +1762,9 @@ def export_results_incremental_gsheet(
     rows_to_append = []
     skipped = 0
     cells_to_update = []
+    added_pending = 0
 
-    for _, row in df.iterrows():
+    for idx, (_, row) in enumerate(df.iterrows(), start=1):
         segmento_txt = str(_pick_row_value(row, ["Categoria", "Segmento", "Segmento_TXT"])).strip()
         cliente = str(_pick_row_value(row, ["Nome", "Cliente", "Estabelecimento", "Nome do estabelecimento", "Empresa (Cliente)"])).strip()
         telefone = _get_primary_phone_ddd(row)
@@ -1769,35 +1799,117 @@ def export_results_incremental_gsheet(
                     existing_info["foto_appsheet"] = foto_appsheet
 
             skipped += 1
-            continue
+        else:
+            rows_to_append.append([
+                segmento_txt,
+                executiva,
+                cliente,
+                responsavel,
+                telefone,
+                email,
+                False,
+                "",
+                "",
+                site,
+                endereco,
+                bairro,
+                cep,
+                updated_str,
+                foto_cell,
+                foto_appsheet,
+            ])
+            added_pending += 1
+            if dedup and key != ("", ""):
+                existing.add(key)
 
-        rows_to_append.append([
-            segmento_txt,
-            executiva,
-            cliente,
-            responsavel,
-            telefone,
-            email,
-            False,
-            "",
-            "",
-            site,
-            endereco,
-            bairro,
-            cep,
-            updated_str,
-            foto_cell,
-            foto_appsheet,
-        ])
-        if dedup and key != ("", ""):
-            existing.add(key)
+        processing_percent = 10 + ((idx / max(1, total_rows)) * 55)
+        _emit_progress(
+            processing_percent,
+            f"Processando registro {idx}/{total_rows}...",
+            current=idx,
+            total=total_rows,
+            item=cliente or endereco or f"Registro {idx}",
+            added=added_pending,
+            skipped_count=skipped,
+            updated_count=len(cells_to_update),
+            phase="prepare",
+        )
+
+    append_chunk_size = 20
+    update_chunk_size = 50
+    appended_done = 0
+    updated_done = 0
 
     if rows_to_append:
-        ws.append_rows(rows_to_append, value_input_option="USER_ENTERED", table_range="C:R")
+        total_append_chunks = math.ceil(len(rows_to_append) / append_chunk_size)
+        for chunk_idx, chunk in enumerate(_chunk_list(rows_to_append, append_chunk_size), start=1):
+            chunk_start = appended_done + 1
+            chunk_end = appended_done + len(chunk)
+            item_label = ""
+            try:
+                item_label = str(chunk[-1][2] or "").strip()
+            except Exception:
+                item_label = ""
+            _emit_progress(
+                68 + ((chunk_idx - 1) / max(1, total_append_chunks)) * 17,
+                f"Enviando novos registros para a planilha ({chunk_end}/{len(rows_to_append)})...",
+                current=min(total_rows, added_pending + skipped),
+                total=total_rows,
+                item=item_label,
+                added=appended_done,
+                skipped_count=skipped,
+                updated_count=updated_done,
+                phase="append",
+            )
+            ws.append_rows(chunk, value_input_option="USER_ENTERED", table_range="C:R")
+            appended_done += len(chunk)
+            _emit_progress(
+                68 + (chunk_idx / max(1, total_append_chunks)) * 17,
+                f"Lote enviado: registros novos {chunk_start}-{chunk_end} de {len(rows_to_append)}.",
+                current=min(total_rows, added_pending + skipped),
+                total=total_rows,
+                item=item_label,
+                added=appended_done,
+                skipped_count=skipped,
+                updated_count=updated_done,
+                phase="append",
+            )
+
+        _emit_progress(86, "Ordenando a aba por segmento...", current=total_rows, total=total_rows, added=appended_done, skipped_count=skipped, updated_count=updated_done, phase="sort")
         _gs_sort_by_segmento(ws, data_rows_count=(len(existing_rows) + len(rows_to_append)))
+    else:
+        _emit_progress(86, "Nenhum novo registro para adicionar. Verificando apenas atualizações pendentes...", current=total_rows, total=total_rows, added=0, skipped_count=skipped, updated_count=0, phase="append")
 
     if cells_to_update:
-        ws.batch_update(cells_to_update, value_input_option="USER_ENTERED")
+        total_update_chunks = math.ceil(len(cells_to_update) / update_chunk_size)
+        for chunk_idx, chunk in enumerate(_chunk_list(cells_to_update, update_chunk_size), start=1):
+            last_range = str(chunk[-1].get("range") or "")
+            _emit_progress(
+                88 + ((chunk_idx - 1) / max(1, total_update_chunks)) * 10,
+                f"Atualizando fotos/URLs em linhas existentes ({updated_done + len(chunk)}/{len(cells_to_update)})...",
+                current=total_rows,
+                total=total_rows,
+                item=last_range,
+                added=appended_done,
+                skipped_count=skipped,
+                updated_count=updated_done,
+                phase="update_existing",
+            )
+            ws.batch_update(chunk, value_input_option="USER_ENTERED")
+            updated_done += len(chunk)
+            _emit_progress(
+                88 + (chunk_idx / max(1, total_update_chunks)) * 10,
+                f"Atualizações aplicadas: {updated_done}/{len(cells_to_update)}.",
+                current=total_rows,
+                total=total_rows,
+                item=last_range,
+                added=appended_done,
+                skipped_count=skipped,
+                updated_count=updated_done,
+                phase="update_existing",
+            )
+
+    _emit_progress(100, "Exportação finalizada com sucesso.", current=total_rows, total=total_rows, added=appended_done, skipped_count=skipped, updated_count=updated_done, phase="done")
 
     return {
         "added": len(rows_to_append),
@@ -1805,6 +1917,7 @@ def export_results_incremental_gsheet(
         "skipped": skipped,
         "spreadsheet_id": spreadsheet_id,
         "worksheet": worksheet_name,
+        "total_input": total_rows,
     }
 
 def nominatim_suggest(query: str, limit: int = 6) -> list[dict]:
@@ -2006,29 +2119,17 @@ def main():
     # ===============================
     CATEGORIES_CONFIG = {
         "🛒 Mercados": {"google_type": "supermarket", "osm": ["shop=supermarket", "shop=convenience", "shop=grocery"]},
-        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual", "municipal", "ciep", "CIEP"]},
+        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual"]},
         "🏫 Faculdades/Universidades": {"google_type": "school", "osm": ["amenity=university"]},
-        "✈️ Agências de Viagens": {
-            "google_type": ["travel_agency", "tourist_information"],
-            "osm": ["shop=travel_agency", "office=travel_agent", "tourism=information"],
-            "google_keywords": [
-                "Agência de Viagens", "Agencia de Viagens", "Turismo", "Viagens",
-                "Pacotes", "Pacotes de viagem", "Passagens", "Passagens aéreas",
-                "Passagens aereas", "Cruzeiro", "Cruzeiros", "Intercâmbio", "Intercambio",
-                "Operadora de turismo", "Operadora", "Excursão", "Excursao"
-            ],
-            "segment_name_any": [
-                "agência de viagens", "agencia de viagens", "turismo", "viagens",
-                "passagens", "passagem", "pacote", "pacotes", "cruzeiro", "intercâmbio", "intercambio",
-                "operadora", "excursão", "excursao"
-            ],
-            "name_exclude": ["hotel", "pousada", "hostel", "motel", "hospedagem"]
-        },
+        # "🏗️ Construtoras": {"google_type": "general_contractor", "osm": ["office=construction", "craft=builder", "office=architect"]},
         "🏥 Hospitais": {"google_type": "hospital", "osm": ["amenity=hospital", "amenity=clinic", "amenity=doctors"]},
         "💊 Farmácias": {"google_type": "pharmacy", "osm": ["amenity=pharmacy"]},
         "🚗 Automotivos": {"google_type": "car_dealer", "osm": ["amenity=car_dealer", "shop=car", "amenity=car_repair", "shop=car_repair"]},
         "🍽️ Restaurantes": {"google_type": "restaurant", "osm": ["amenity=restaurant", "amenity=cafe", "amenity=fast_food"]},
+        "🏦 Bancos": {"google_type": "bank", "osm": ["amenity=bank", "amenity=atm"]},
+        "⛽ Postos": {"google_type": "gas_station", "osm": ["amenity=fuel"]},
         "💪 Academias": {"google_type": "gym", "osm": ["leisure=fitness_centre", "leisure=sports_centre"]},
+        "🏬 Shoppings": {"google_type": "shopping_mall", "osm": ["shop=mall"]},
         "🚘 Concessionárias": {
             "google_type": "car_dealer",
             "osm": ["amenity=car_dealer", "shop=car"],
@@ -2036,7 +2137,7 @@ def main():
             "name_must_contain": ["jeep", "fiat", "ford", "volkswagen", "vw", "chevrolet", "hyundai", "nissan", "renault", "honda", "toyota","mitsubishi", "kia", "peugeot", "citroën", "suzuki", "jac", "byd", "chery", "lifan"],
             "name_exclude": ["hotel", "pousada", "hostel", "hospedagem", "motel"]
         },
-        "🏗️ Construtoras / Incorporadoras": {
+        "🏗️ Construtoras (MRV etc)": {
             "google_type": ["general_contractor", "real_estate_agency"],
             "osm": ["office=construction", "craft=builder", "office=architect"],
             "google_keywords": ["Stand de vendas", "Estande de vendas", "Plantão de vendas", "Plantao de vendas", "Stand imobiliário", "Estande imobiliário", "Estande imobiliario", "Stand", "Estande", "Gafisa", "Mozak", "Mozak Rio", "LatinExclusive", "Latin Exclusive", "Incorporadora Gafisa", "Incorporadora Mozak", "Incorporadora Latin Exclusive", "Construtora MRV", "Construtora Direcional", "Construtora Tenda", "Construtora Cury", "Construtora Cyrela", "Construtora Even", "Construtora Gafisa","Construtora Rossi", "Construtora Trisul", "Construtora Eztec", "Construtora Tecnisa", "Construtora Brookfield", "Construtora Plaenge", "Construtora Mitre", "Construtora Viver", "Construtora Rodobens", "Construtora Patrimar", "Incorporadora", "Incorporação imobiliária", "Incorporadora MRV", "Incorporadora Direcional", "Incorporadora Tenda", "Incorporadora Cury", "Incorporadora Cyrela", "Incorporadora Even", "Incorporadora Gafisa", "Incorporadora Mitre", "Incorporadora Eztec"],
@@ -2050,16 +2151,19 @@ def main():
         "🛒 Mercados": "blue",
         "🏫 Escolas": "green",
         "🏫 Faculdades/Universidades": "green",
-       "✈️ Agências de Viagens" : "cyan",
+        "🏗️ Construtoras": "orange",
         "🏥 Hospitais": "red",
         "💊 Farmácias": "purple",
         "🚗 Automotivos":"darkcyan",
         "🍽️ Restaurantes": "darkred",
+        "🏦 Bancos": "darkblue",
+        "⛽ Postos": "gray",
         "💪 Academias": "darkgreen",
         "🏬 Shoppings": "cadetblue",
         "🚘 Concessionárias": "lightblue",
-        "🏗️ Construtoras / Incorporadoras": "orange",
+        "🏗️ Construtoras (MRV etc)": "orange",
     }
+
     def _filter_rows_by_cfg(rows, cfg):
         """Filtra linhas retornadas (Google/OSM) com base em regras da categoria.
         Suporta:
@@ -3293,9 +3397,47 @@ def main():
             )
 
             if exp_btn_gs:
+                progress_bar = st.progress(0, text="Preparando exportação...")
+                progress_status = st.empty()
+                progress_counts = st.empty()
+                progress_item = st.empty()
+
+                def _render_gsheet_progress(payload: dict):
+                    pct = int(max(0, min(100, round(float(payload.get("percent", 0))))))
+                    msg = str(payload.get("message") or "Processando...")
+                    current = int(payload.get("current") or 0)
+                    total = int(payload.get("total") or 0)
+                    item = str(payload.get("item") or "").strip()
+                    added = int(payload.get("added") or 0)
+                    skipped_count = int(payload.get("skipped") or 0)
+                    updated_count = int(payload.get("updated") or 0)
+
+                    progress_bar.progress(pct, text=msg)
+                    progress_status.markdown(f"**Status:** {msg}")
+                    progress_counts.markdown(
+                        f"**Progresso:** {current}/{total if total else current}  \
+**Novos prontos/enviados:** {added}  \
+**Duplicados ignorados:** {skipped_count}  \
+**Atualizações de foto/url:** {updated_count}"
+                    )
+                    if item:
+                        progress_item.markdown(f"**Registro atual:** {item}")
+                    else:
+                        progress_item.empty()
+
                 try:
                     st.session_state.gsheet_url = gsheet_url
                     dt = st.session_state.get("search_dt")
+                    _render_gsheet_progress({
+                        "percent": 1,
+                        "message": "Iniciando exportação para Google Planilhas...",
+                        "current": 0,
+                        "total": int(len(df_export.index)) if df_export is not None else 0,
+                        "item": "",
+                        "added": 0,
+                        "skipped": 0,
+                        "updated": 0,
+                    })
                     stats = export_results_incremental_gsheet(
                         df=df_export,
                         spreadsheet_url_or_id=gsheet_url,
@@ -3306,11 +3448,24 @@ def main():
                         sa_info_override=sa_info_override,
                         cred_path_override=cred_path_override,
                         google_api_key_for_photo=api_key,
+                        progress_callback=_render_gsheet_progress,
                     )
+
+                    _render_gsheet_progress({
+                        "percent": 100,
+                        "message": "Exportação concluída com sucesso.",
+                        "current": int(stats.get("total_input") or 0),
+                        "total": int(stats.get("total_input") or 0),
+                        "item": "",
+                        "added": int(stats.get("added") or 0),
+                        "skipped": int(stats.get("skipped") or 0),
+                        "updated": int(stats.get("updated_photo_cells") or 0),
+                    })
 
                     st.success(
                         f"✅ Exportação concluída! Registros adicionados: **{stats['added']}**"
                         + (f" • Duplicados ignorados: **{stats['skipped']}**" if dedup_gs else "")
+                        + (f" • Atualizações de foto/url: **{stats['updated_photo_cells']}**" if int(stats.get('updated_photo_cells') or 0) > 0 else "")
                     )
 
                     try:
@@ -3320,6 +3475,8 @@ def main():
                         pass
 
                 except Exception as e:
+                    progress_bar.progress(100, text="Exportação encerrada com erro.")
+                    progress_status.markdown("**Status:** Falha na exportação.")
                     st.error(f"❌ Falha ao exportar para Google Planilhas: {e}")
 
 
@@ -3382,7 +3539,7 @@ def _run_streamlit_from_python():
     print(f"🔗 URL: http://127.0.0.1:{port}")
     print("=" * 60)
     # Bloqueia no processo do Streamlit (CTRL+C para parar)
-    subprocess.run(args)
+    # subprocess.run(args)
 
 
 if __name__ == "__main__":
