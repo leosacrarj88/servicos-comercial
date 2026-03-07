@@ -1967,29 +1967,17 @@ def main():
     # ===============================
     CATEGORIES_CONFIG = {
         "🛒 Mercados": {"google_type": "supermarket", "osm": ["shop=supermarket", "shop=convenience", "shop=grocery"]},
-        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual", "municipal", "ciep", "CIEP"]},
+        "🏫 Escolas": {"google_type": ["school", "primary_school", "secondary_school"], "osm": ["amenity=school", "amenity=kindergarten", "amenity=university", "amenity=language_school"], "google_keywords": ["Escola", "Colégio", "Curso de inglês", "Escola de idiomas", "Maple Bear", "Maple Bear Canadian School", "CCAA", "Fisk", "CNA", "Wizard", "Wise Up", "KNN Idiomas", "Yázigi", "Yes! Idiomas", "Cultura Inglesa"], "name_exclude": ["estadual"]},
         "🏫 Faculdades/Universidades": {"google_type": "school", "osm": ["amenity=university"]},
-        "✈️ Agências de Viagens": {
-            "google_type": ["travel_agency", "tourist_information"],
-            "osm": ["shop=travel_agency", "office=travel_agent", "tourism=information"],
-            "google_keywords": [
-                "Agência de Viagens", "Agencia de Viagens", "Turismo", "Viagens",
-                "Pacotes", "Pacotes de viagem", "Passagens", "Passagens aéreas",
-                "Passagens aereas", "Cruzeiro", "Cruzeiros", "Intercâmbio", "Intercambio",
-                "Operadora de turismo", "Operadora", "Excursão", "Excursao"
-            ],
-            "segment_name_any": [
-                "agência de viagens", "agencia de viagens", "turismo", "viagens",
-                "passagens", "passagem", "pacote", "pacotes", "cruzeiro", "intercâmbio", "intercambio",
-                "operadora", "excursão", "excursao"
-            ],
-            "name_exclude": ["hotel", "pousada", "hostel", "motel", "hospedagem"]
-        },
+        # "🏗️ Construtoras": {"google_type": "general_contractor", "osm": ["office=construction", "craft=builder", "office=architect"]},
         "🏥 Hospitais": {"google_type": "hospital", "osm": ["amenity=hospital", "amenity=clinic", "amenity=doctors"]},
         "💊 Farmácias": {"google_type": "pharmacy", "osm": ["amenity=pharmacy"]},
         "🚗 Automotivos": {"google_type": "car_dealer", "osm": ["amenity=car_dealer", "shop=car", "amenity=car_repair", "shop=car_repair"]},
         "🍽️ Restaurantes": {"google_type": "restaurant", "osm": ["amenity=restaurant", "amenity=cafe", "amenity=fast_food"]},
+        "🏦 Bancos": {"google_type": "bank", "osm": ["amenity=bank", "amenity=atm"]},
+        "⛽ Postos": {"google_type": "gas_station", "osm": ["amenity=fuel"]},
         "💪 Academias": {"google_type": "gym", "osm": ["leisure=fitness_centre", "leisure=sports_centre"]},
+        "🏬 Shoppings": {"google_type": "shopping_mall", "osm": ["shop=mall"]},
         "🚘 Concessionárias": {
             "google_type": "car_dealer",
             "osm": ["amenity=car_dealer", "shop=car"],
@@ -1997,7 +1985,7 @@ def main():
             "name_must_contain": ["jeep", "fiat", "ford", "volkswagen", "vw", "chevrolet", "hyundai", "nissan", "renault", "honda", "toyota","mitsubishi", "kia", "peugeot", "citroën", "suzuki", "jac", "byd", "chery", "lifan"],
             "name_exclude": ["hotel", "pousada", "hostel", "hospedagem", "motel"]
         },
-        "🏗️ Construtoras / Incorporadoras": {
+        "🏗️ Construtoras (MRV etc)": {
             "google_type": ["general_contractor", "real_estate_agency"],
             "osm": ["office=construction", "craft=builder", "office=architect"],
             "google_keywords": ["Stand de vendas", "Estande de vendas", "Plantão de vendas", "Plantao de vendas", "Stand imobiliário", "Estande imobiliário", "Estande imobiliario", "Stand", "Estande", "Gafisa", "Mozak", "Mozak Rio", "LatinExclusive", "Latin Exclusive", "Incorporadora Gafisa", "Incorporadora Mozak", "Incorporadora Latin Exclusive", "Construtora MRV", "Construtora Direcional", "Construtora Tenda", "Construtora Cury", "Construtora Cyrela", "Construtora Even", "Construtora Gafisa","Construtora Rossi", "Construtora Trisul", "Construtora Eztec", "Construtora Tecnisa", "Construtora Brookfield", "Construtora Plaenge", "Construtora Mitre", "Construtora Viver", "Construtora Rodobens", "Construtora Patrimar", "Incorporadora", "Incorporação imobiliária", "Incorporadora MRV", "Incorporadora Direcional", "Incorporadora Tenda", "Incorporadora Cury", "Incorporadora Cyrela", "Incorporadora Even", "Incorporadora Gafisa", "Incorporadora Mitre", "Incorporadora Eztec"],
@@ -2011,15 +1999,17 @@ def main():
         "🛒 Mercados": "blue",
         "🏫 Escolas": "green",
         "🏫 Faculdades/Universidades": "green",
-       "✈️ Agências de Viagens" : "cyan",
+        "🏗️ Construtoras": "orange",
         "🏥 Hospitais": "red",
         "💊 Farmácias": "purple",
         "🚗 Automotivos":"darkcyan",
         "🍽️ Restaurantes": "darkred",
+        "🏦 Bancos": "darkblue",
+        "⛽ Postos": "gray",
         "💪 Academias": "darkgreen",
         "🏬 Shoppings": "cadetblue",
         "🚘 Concessionárias": "lightblue",
-        "🏗️ Construtoras / Incorporadoras": "orange",
+        "🏗️ Construtoras (MRV etc)": "orange",
     }
 
     def _filter_rows_by_cfg(rows, cfg):
@@ -2081,12 +2071,40 @@ def main():
         st.session_state.last_error = None
     if "debug" not in st.session_state:
         st.session_state.debug = []
+    if "addr_input" not in st.session_state:
+        st.session_state.addr_input = ""
+    if "addr_hist_sel" not in st.session_state:
+        st.session_state.addr_hist_sel = "(digitar novo)"
+    if "addr_suggestions" not in st.session_state:
+        st.session_state.addr_suggestions = []
+    if "addr_last_query" not in st.session_state:
+        st.session_state.addr_last_query = ""
+    if "trigger_search" not in st.session_state:
+        st.session_state.trigger_search = False
 
     def clear_all():
         st.session_state.results_df = None
         st.session_state.origin = None
         st.session_state.last_error = None
         st.session_state.debug = []
+        st.session_state.addr_input = ""
+        st.session_state.addr_hist_sel = "(digitar novo)"
+        st.session_state.addr_suggestions = []
+        st.session_state.addr_last_query = ""
+        st.session_state.trigger_search = False
+
+    def _on_hist_change():
+        sel = (st.session_state.get("addr_hist_sel") or "(digitar novo)").strip()
+        if sel and sel != "(digitar novo)":
+            st.session_state["addr_input"] = sel
+
+    def _on_addr_change():
+        typed = (st.session_state.get("addr_input") or "").strip()
+        sel = (st.session_state.get("addr_hist_sel") or "(digitar novo)").strip()
+        if sel != "(digitar novo)" and typed != sel:
+            st.session_state["addr_hist_sel"] = "(digitar novo)"
+        # Permite pressionar ENTER no campo para disparar a busca
+        st.session_state.trigger_search = bool(typed)
 
     # ===============================
     # UTILS
@@ -2788,17 +2806,25 @@ def main():
         api_key = default_api_key
         _hist = load_address_history(limit=25)
         _hist_opts = ["(digitar novo)"] + _hist
-        _sel = st.selectbox("🕘 Histórico de endereços", options=_hist_opts, index=0, key="addr_hist_sel")
-
-        # Se escolher no histórico, auto-preenche o campo
-        if _sel != "(digitar novo)":
-            st.session_state["addr_input"] = _sel
+        _current_hist = st.session_state.get("addr_hist_sel", "(digitar novo)")
+        if _current_hist not in _hist_opts:
+            _current_hist = "(digitar novo)"
+            st.session_state["addr_hist_sel"] = _current_hist
+        _hist_index = _hist_opts.index(_current_hist)
+        st.selectbox(
+            "🕘 Histórico de endereços",
+            options=_hist_opts,
+            index=_hist_index,
+            key="addr_hist_sel",
+            on_change=_on_hist_change,
+        )
 
         # Campo principal (bonito e estável)
         st.text_input(
             "📍 Endereço",
             key="addr_input",
             placeholder="Digite (rua, número, bairro, cidade)...",
+            on_change=_on_addr_change,
         )
 
         # Sugestões estilo Google (aparecem enquanto digita) — estável e bonito
@@ -2893,7 +2919,7 @@ def main():
 
         debug = st.checkbox("🧪 Debug (ver status/erros)", value=False)
 
-        go = st.button("🚀 Buscar", type="primary", use_container_width=True)
+        go = st.button("🚀 Buscar", type="primary", use_container_width=True) or bool(st.session_state.pop("trigger_search", False))
 
         st.button("🧹 Limpar", use_container_width=True, on_click=clear_all)
 
